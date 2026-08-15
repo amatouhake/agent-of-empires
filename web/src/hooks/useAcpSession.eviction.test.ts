@@ -16,7 +16,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState } from "../lib/acpTypes";
+import { applyEvent, emptyAcpState } from "../lib/acpTypes";
 import { __test } from "./useAcpSession";
 
 const { persistState, loadPersistedState, evictOldestPersistedAcpState, STORAGE_KEY_PREFIX } = __test;
@@ -92,6 +92,45 @@ describe("loadPersistedState schema backfill", () => {
     window.localStorage.setItem(`${STORAGE_KEY_PREFIX}sess-keep`, JSON.stringify({ savedAt: Date.now(), state }));
     const loaded = loadPersistedState("sess-keep");
     expect(loaded?.pendingElicitations.map((e) => e.nonce)).toEqual(["e-1"]);
+  });
+
+  it("restores an agent epoch until a newer durable terminal replays", () => {
+    const state = {
+      ...emptyAcpState(),
+      lastSeq: 2,
+      turnActive: true,
+      agentInitiatedTurnActive: true,
+    };
+    persistState("sess-agent-epoch", state);
+
+    const loaded = loadPersistedState("sess-agent-epoch");
+    expect(loaded?.turnActive).toBe(true);
+    expect(loaded?.agentInitiatedTurnActive).toBe(true);
+    const stopped = applyEvent(loaded!, {
+      session_id: "sess-agent-epoch",
+      seq: 3,
+      event: { Stopped: { reason: "agent_idle" } },
+    });
+    expect(stopped.turnActive).toBe(false);
+    expect(stopped.agentInitiatedTurnActive).toBe(false);
+  });
+
+  it("does not persist transient prompt intent", () => {
+    const state = {
+      ...emptyAcpState(),
+      activity: [
+        {
+          id: "user-local",
+          kind: "user_prompt" as const,
+          text: "steer",
+          at: "2026-01-01T00:00:00Z",
+          promptIntent: "steer" as const,
+        },
+      ],
+    };
+    persistState("sess-prompt-intent", state);
+
+    expect(loadPersistedState("sess-prompt-intent")?.activity[0]?.promptIntent).toBeUndefined();
   });
 });
 

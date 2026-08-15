@@ -450,6 +450,34 @@ describe("applyEvent / PromptRejected (#1196)", () => {
     expect(state.turnActive).toBe(false);
   });
 
+  it("keeps the original turn active when a steering message is rejected", () => {
+    let state = applyEvent(
+      {
+        ...emptyAcpState(),
+        promptCapabilities: { image: false, audio: false, embeddedContext: false, steering: true },
+      },
+      { session_id: "s-1", seq: 1, event: { UserPromptSent: { text: "start" } } },
+    );
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "steer" } },
+    });
+    expect(state.pendingUserPromptSeq).toBe(1);
+
+    state = applyEvent(state, rejectFrame(3, "steer"));
+    expect(state.lastStoppedSeq).toBe(0);
+    expect(state.turnActive).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.lastStoppedSeq).toBe(1);
+    expect(state.turnActive).toBe(false);
+  });
+
   it("caps the rejected-prompts FIFO at 5 entries", () => {
     let state: AcpState = { ...emptyAcpState(), pendingUserPromptSeq: 10 };
     for (let i = 0; i < 7; i++) {

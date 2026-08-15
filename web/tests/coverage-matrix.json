@@ -3161,6 +3161,18 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/acpTypes.ts", "web/src/components/acp/Composer.tsx"]
     },
     {
+      "id": "acp.agent-initiated-turn-rearm",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/acpTypes.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
+        "src/hooks/useAcpSession.eviction.test.ts",
+        "src/components/acp/__tests__/useCancelEscalation.test.tsx"
+      ],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/acpTypes.ts"]
+    },
+    {
       "id": "story.wizard-open-close",
       "kind": "mocked-playwright",
       "risk": "low",

@@ -15,6 +15,7 @@ import {
   isTurnActive,
   mergePrependedActivity,
   normaliseTurnCounters,
+  promptCreatesTurnClaim,
   reduceFrames,
   setActivityLimit,
   summarizeAnswers,
@@ -25,6 +26,7 @@ import {
   type BackgroundAgent,
   type ElicitationResolution,
   type PromptAttachmentInput,
+  type PromptIntent,
   type QueuedPrompt,
 } from "../lib/acpTypes";
 import {
@@ -62,8 +64,8 @@ export type Action =
   | { kind: "prepend"; frames: AcpFrame[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
   | { kind: "lagged"; skipped: number }
-  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
-  | { kind: "prompt_send_rejected" }
+  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string; intent: PromptIntent }
+  | { kind: "prompt_send_rejected"; intent: PromptIntent }
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
@@ -168,17 +170,30 @@ function evictOldestPersistedAcpState(currentKey: string): boolean {
 }
 
 /** Project the in-memory reducer state into the shape written to
- *  localStorage. Queued prompts that carry attachments are dropped
+ *  localStorage. Prompt intent is acknowledgement-only lifecycle state,
+ *  so it is stripped from transcript rows. Queued prompts that carry attachments are dropped
  *  entirely: their base64 bytes would blow the per-origin quota, and
  *  persisting the text alone would silently drain a degraded prompt on
  *  reload (e.g. "fix this screenshot:" with no screenshot). The full
  *  row stays in the in-memory `stateCache`, so it survives a component
  *  remount but not a hard page reload. See #1833 / #1000. */
 function toPersistedState(state: AcpState): AcpState {
-  if (!state.queuedPrompts.some((q) => q.attachments?.length)) return state;
+  const hasPromptIntent = state.activity.some((row) => row.promptIntent !== undefined);
+  const hasQueuedAttachments = state.queuedPrompts.some((q) => q.attachments?.length);
+  if (!hasPromptIntent && !hasQueuedAttachments) return state;
   return {
     ...state,
-    queuedPrompts: state.queuedPrompts.filter((q) => !q.attachments?.length),
+    activity: hasPromptIntent
+      ? state.activity.map((row) => {
+          if (row.promptIntent === undefined) return row;
+          const persisted = { ...row };
+          delete persisted.promptIntent;
+          return persisted;
+        })
+      : state.activity,
+    queuedPrompts: hasQueuedAttachments
+      ? state.queuedPrompts.filter((q) => !q.attachments?.length)
+      : state.queuedPrompts,
   };
 }
 
@@ -634,14 +649,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     return action.state;
   }
   if (action.kind === "user_prompt") {
-    // Bump `pendingUserPromptSeq` rather than touching `turnActive`
-    // directly. `turnActive` derives from `pendingUserPromptSeq >
-    // lastStoppedSeq`; the derived alias is recomputed here so any
-    // existing `state.turnActive` reads stay consistent without a
-    // selector hop. Without this the late `Stopped` from the prior
-    // turn could clobber the spinner mid follow-up. See #1170.
-    const pendingUserPromptSeq = state.pendingUserPromptSeq + 1;
-    return {
+    // The counter tracks daemon turns, not user messages. A steer joins
+    // the existing turn and therefore creates no new terminal claim.
+    const pendingUserPromptSeq = state.pendingUserPromptSeq + (promptCreatesTurnClaim(action.intent) ? 1 : 0);
+    const next: AcpState = {
       ...state,
       activity: state.activity.concat({
         // Accept a caller-supplied id so a transient send failure can
@@ -651,35 +662,38 @@ export function reducer(state: AcpState, action: Action): AcpState {
         kind: "user_prompt",
         text: action.text,
         attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
+        promptIntent: action.intent,
         at: new Date().toISOString(),
       }),
-      assistantMessage: "",
-      // A fresh prompt clears stale errors: the user has indicated
-      // they're trying again, so don't keep nagging them.
-      startupError: null,
-      lastError: null,
       pendingUserPromptSeq,
-      turnActive: isTurnActive({
-        pendingUserPromptSeq,
-        lastStoppedSeq: state.lastStoppedSeq,
-      }),
+      agentInitiatedTurnActive: action.intent === "new_turn" ? false : state.agentInitiatedTurnActive,
+      turnActive: true,
     };
+    if (action.intent === "new_turn") {
+      next.assistantMessage = "";
+      // A fresh prompt clears stale errors immediately. A steer belongs to
+      // the existing turn and must preserve its accumulated state.
+      next.startupError = null;
+      next.lastError = null;
+    }
+    return next;
   }
   if (action.kind === "prompt_send_rejected") {
-    // Optimistic submit already bumped pendingUserPromptSeq. When the
-    // prompt POST is rejected client-side (for example unsupported
-    // attachments), retire exactly one pending turn so Stop unlocks and
-    // the composer returns to idle without waiting for a Stopped frame
-    // that will never arrive.
-    const lastStoppedSeq = Math.min(state.lastStoppedSeq + 1, state.pendingUserPromptSeq);
+    // A rejected new turn will not receive Stopped, so retire its claim.
+    // A rejected steer added no claim and must leave the original turn
+    // active for its eventual terminal.
+    const lastStoppedSeq = promptCreatesTurnClaim(action.intent)
+      ? Math.min(state.lastStoppedSeq + 1, state.pendingUserPromptSeq)
+      : state.lastStoppedSeq;
     return {
       ...state,
       inFlightTool: null,
       lastStoppedSeq,
-      turnActive: isTurnActive({
-        pendingUserPromptSeq: state.pendingUserPromptSeq,
-        lastStoppedSeq,
-      }),
+      turnActive:
+        isTurnActive({
+          pendingUserPromptSeq: state.pendingUserPromptSeq,
+          lastStoppedSeq,
+        }) || state.agentInitiatedTurnActive,
     };
   }
   if (action.kind === "rollback_optimistic_prompt") {
@@ -1591,7 +1605,11 @@ export function useAcpSession(
   //   - "retryable_failure": a transient disconnect / 5xx / network error,
   //     so keep the queue intact for the next turn-end retry.
   const dispatchPromptNow = useCallback(
-    async (text: string, attachments?: PromptAttachmentInput[]): Promise<PromptSendResult> => {
+    async (
+      text: string,
+      attachments: PromptAttachmentInput[] | undefined,
+      intent: PromptIntent,
+    ): Promise<PromptSendResult> => {
       if (!sessionId) return "retryable_failure";
       if (statusRef.current !== "open") {
         dispatch({
@@ -1624,6 +1642,7 @@ export function useAcpSession(
         id: optimisticId,
         text,
         attachments: previews.length > 0 ? previews : undefined,
+        intent,
       });
       // Submit counts as activity so the force-end-turn watchdog
       // doesn't surface the escape hatch immediately on a fresh prompt
@@ -1665,7 +1684,7 @@ export function useAcpSession(
           // suppress the banner for attachment sends too. See #1833.
           const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
           if (rejected) {
-            dispatch({ kind: "prompt_send_rejected" });
+            dispatch({ kind: "prompt_send_rejected", intent });
           } else if (workerNotReady) {
             // Undo the optimistic row + turn: the caller re-queues this
             // prompt, so it must live only in the queue until the drain
@@ -1764,8 +1783,16 @@ export function useAcpSession(
       // swallows the message into a turn that never replies to it, with no
       // retry affordance. Park it and let the drain fire it as the next
       // turn, against the freshly compacted context. See #3219.
-      const turnBlocks =
-        state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling && !state.compacting);
+      const userPromptTurnActive = isTurnActive({
+        pendingUserPromptSeq: state.pendingUserPromptSeq,
+        lastStoppedSeq: state.lastStoppedSeq,
+      });
+      const canSteer =
+        userPromptTurnActive && !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;
+      // A between-prompt agent epoch has no prompt request in flight. The
+      // daemon lets a real prompt supersede it, so only a user-prompt
+      // lifecycle can block or steer this send.
+      const turnBlocks = userPromptTurnActive && !canSteer;
       const blockedAsideFromWorker = wsClosed || turnBlocks || state.workerStopped || state.workerRestarting;
       const shouldEnqueue = state.workerIdleStopped
         ? blockedAsideFromWorker
@@ -1787,7 +1814,7 @@ export function useAcpSession(
         reportAcpInteraction("prompt_queued");
         return;
       }
-      const result = await dispatchPromptNow(text, attachments);
+      const result = await dispatchPromptNow(text, attachments, canSteer ? "steer" : "new_turn");
       // Idle-dormant direct send: the worker was respawning and did not
       // come online within send_prompt's wait window, so the POST returned
       // a retryable typed 503. Park the prompt (with its attachments)
@@ -1804,7 +1831,8 @@ export function useAcpSession(
     },
     [
       sessionId,
-      state.turnActive,
+      state.pendingUserPromptSeq,
+      state.lastStoppedSeq,
       state.promptCapabilities?.steering,
       state.cancelling,
       state.compacting,
@@ -1893,6 +1921,7 @@ export function useAcpSession(
       const result = await dispatchPromptNow(
         combined,
         combinedAttachments.length > 0 ? combinedAttachments : undefined,
+        "new_turn",
       );
       // Retire on success and on non-retryable rejection; only a
       // transient failure keeps the batch queued for the next retry.
