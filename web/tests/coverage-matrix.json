@@ -1450,6 +1450,20 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.grouped-lifecycle-actions",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SessionRowLifecycleActions.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/sidebarGroups.ts"]
+    },
+    {
+      "id": "sidebar.grouped-lifecycle-app-wiring",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-grouped-lifecycle-actions.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "session.trash",
       "kind": "live-playwright",
       "risk": "high",

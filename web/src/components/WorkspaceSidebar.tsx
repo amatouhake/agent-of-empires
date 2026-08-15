@@ -357,8 +357,8 @@ interface Props {
   /** Purge every trashed workspace in one action (#3167), mirroring the TUI
    *  Empty Trash. Confirmation lives in the Trash panel; this just runs it. */
   onEmptyTrash?: () => void;
-  onStopSession?: (workspaceId: string) => void;
-  onStartSession?: (workspaceId: string) => void;
+  onStopSession?: (sessionId: string) => void;
+  onStartSession?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** When false (CityHall client mode), the Projects management section is
@@ -373,6 +373,13 @@ interface Props {
   onAxisChange: (axis: SidebarAxis) => void;
 }
 
+function statusRepresentativeCandidates(ws: Workspace, idleDecayWindowMs: number): SessionResponse[] {
+  const active = ws.sessions.filter((s) => isSessionActive(s, idleDecayWindowMs));
+  if (active.length > 0) return active;
+  const errors = ws.sessions.filter((s) => s.status === "Error");
+  return errors.length > 0 ? errors : ws.sessions;
+}
+
 function bestSession(
   ws: Workspace,
   idleDecayWindowMs: number,
@@ -382,28 +389,42 @@ function bestSession(
   idleEnteredAt: string | null;
   dormant: boolean;
 } {
-  const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-  if (running)
-    return {
-      status: running.status,
-      createdAt: running.created_at,
-      idleEnteredAt: running.idle_entered_at ?? null,
-      dormant: running.dormant,
-    };
-  const error = ws.sessions.find((s) => s.status === "Error");
-  if (error)
+  const first = statusRepresentativeCandidates(ws, idleDecayWindowMs)[0];
+  if (first?.status === "Error") {
     return {
       status: "Error",
-      createdAt: error.created_at,
+      createdAt: first.created_at,
       idleEnteredAt: null,
       dormant: false,
     };
-  const first = ws.sessions[0];
+  }
   return {
     status: first?.status ?? "Unknown",
     createdAt: first?.created_at ?? null,
     idleEnteredAt: first?.idle_entered_at ?? null,
     dormant: first?.dormant ?? false,
+  };
+}
+
+function canStopSession(session: SessionResponse): boolean {
+  return !["Stopped", "Deleting", "Creating"].includes(session.status);
+}
+
+/** Identity shown when a grouped lifecycle action needs an exact target.
+ *  Title, tool, and status match the sidebar's existing conventions. Only add
+ *  the id when those fields still collide, keeping the common case compact. */
+function lifecycleSessionIdentity(session: SessionResponse, candidates: SessionResponse[]) {
+  const title = session.title.trim() || "Untitled session";
+  const duplicate = candidates.some(
+    (candidate) =>
+      candidate.id !== session.id &&
+      (candidate.title.trim() || "Untitled session") === title &&
+      candidate.tool === session.tool &&
+      candidate.status === session.status,
+  );
+  return {
+    title,
+    meta: `${session.tool} · ${session.status}${duplicate ? ` · ${session.id}` : ""}`,
   };
 }
 
@@ -848,8 +869,8 @@ function SortableSessionRow({
   isSelected: boolean;
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
-  onStop?: (workspaceId: string) => void;
-  onStart?: (workspaceId: string) => void;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
@@ -994,8 +1015,8 @@ export const SessionRow = memo(function SessionRow({
   // than navigating directly. See #1724.
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
-  onStop?: (workspaceId: string) => void;
-  onStart?: (workspaceId: string) => void;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
   // Switch this row's session between structured view and terminal. The parent
   // (App) opens the confirm dialog and calls acp enable/disable. See #2252.
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
@@ -1034,6 +1055,13 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
+  // The same winning class that supplies the row status owns its lifecycle
+  // actions. A unique candidate stays one-click; siblings in an equal-priority
+  // class are listed explicitly so array order never selects the mutation.
+  const lifecycleCandidates = statusRepresentativeCandidates(workspace, idleDecayWindowMs);
+  const lifecycleSession = lifecycleCandidates.length === 1 ? lifecycleCandidates[0]! : null;
+  const stopCandidates = lifecycleCandidates.filter(canStopSession);
+  const startCandidates = lifecycleCandidates.filter((session) => session.status === "Stopped");
   // Repo path used to prefill a "New Session" launched from this row, matching
   // the per-project "+" button (handleCreateSession keys off this same path).
   const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
@@ -1457,20 +1485,22 @@ export const SessionRow = memo(function SessionRow({
     onDelete?.(workspace.id);
   };
 
-  const handleStop = () => {
+  const handleStop = (session: SessionResponse | null) => {
     setContextMenu(null);
-    onStop?.(workspace.id);
+    if (session) onStop?.(session.id);
   };
-  // Mirror the TUI's `x` guard: a session that is already stopped or
-  // mid-lifecycle has nothing to stop, so hide the action for those.
-  const canStop = !["Stopped", "Deleting", "Creating"].includes(sessionStatus);
+  // Mirror the TUI's `x` guard. Ambiguous equal-priority siblings remain
+  // actionable through the explicit candidate list in the context menu.
+  const canStop = !!lifecycleSession && canStopSession(lifecycleSession);
 
-  const handleStart = () => {
+  const handleStart = (session: SessionResponse | null) => {
     setContextMenu(null);
-    onStart?.(workspace.id);
+    if (session) onStart?.(session.id);
   };
   // Start is the inverse of Stop: only offered for a stopped session.
-  const canStart = sessionStatus === "Stopped";
+  const canStart = lifecycleSession?.status === "Stopped";
+  const showStopPicker = lifecycleCandidates.length > 1 && stopCandidates.length > 0;
+  const showStartPicker = lifecycleCandidates.length > 1 && startCandidates.length > 0;
 
   if (renaming) {
     return (
@@ -1842,7 +1872,7 @@ export const SessionRow = memo(function SessionRow({
                 )}
                 {!readOnly && canStop && (
                   <button
-                    onClick={handleStop}
+                    onClick={() => handleStop(lifecycleSession)}
                     data-testid="sidebar-context-menu-stop"
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
@@ -1852,13 +1882,67 @@ export const SessionRow = memo(function SessionRow({
                 )}
                 {!readOnly && canStart && (
                   <button
-                    onClick={handleStart}
+                    onClick={() => handleStart(lifecycleSession)}
                     data-testid="sidebar-context-menu-start"
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <Play className="h-3.5 w-3.5 shrink-0" />
                     Start
                   </button>
+                )}
+                {!readOnly && showStopPicker && (
+                  <div data-testid="sidebar-context-menu-stop-picker">
+                    <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                      Stop session
+                    </div>
+                    {stopCandidates.map((session) => {
+                      const identity = lifecycleSessionIdentity(session, stopCandidates);
+                      return (
+                        <button
+                          key={session.id}
+                          onClick={() => handleStop(session)}
+                          data-testid={`sidebar-context-menu-stop-session-${session.id}`}
+                          aria-label={`Stop ${identity.title}, ${identity.meta}, session ${session.id}`}
+                          className="w-full min-w-0 text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <CircleStop className="h-3.5 w-3.5 shrink-0" />
+                          <span className="min-w-0">
+                            <span className="block truncate">{identity.title}</span>
+                            <span className="block truncate text-[11px] font-mono text-text-muted">
+                              {identity.meta}
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {!readOnly && showStartPicker && (
+                  <div data-testid="sidebar-context-menu-start-picker">
+                    <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                      Start session
+                    </div>
+                    {startCandidates.map((session) => {
+                      const identity = lifecycleSessionIdentity(session, startCandidates);
+                      return (
+                        <button
+                          key={session.id}
+                          onClick={() => handleStart(session)}
+                          data-testid={`sidebar-context-menu-start-session-${session.id}`}
+                          aria-label={`Start ${identity.title}, ${identity.meta}, session ${session.id}`}
+                          className="w-full min-w-0 text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <Play className="h-3.5 w-3.5 shrink-0" />
+                          <span className="min-w-0">
+                            <span className="block truncate">{identity.title}</span>
+                            <span className="block truncate text-[11px] font-mono text-text-muted">
+                              {identity.meta}
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 )}
                 <div className="border-t border-surface-700/20 my-1" />
                 <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
