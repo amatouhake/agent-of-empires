@@ -11,7 +11,8 @@ import {
 } from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
-import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
+import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
+import { groupedParentNavigationSession, sidebarSessionsInDisplayOrder } from "./lib/sessionDisplay";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
@@ -91,7 +92,7 @@ import {
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
-import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
+import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
@@ -151,7 +152,7 @@ import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
-import type { ProjectInfo, RepoGroup, SessionResponse } from "./lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
@@ -328,7 +329,6 @@ function AppContent({
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
@@ -959,31 +959,30 @@ function AppContent({
     [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
   );
 
-  const handleSelectWorkspace = (workspaceId: string) => {
-    const ws = workspaces.find((w) => w.id === workspaceId);
-    if (ws) {
-      const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-      const picked = running ?? ws.sessions[0] ?? null;
-      if (picked) {
-        transitionKeyboardProxy(picked.id);
-        navigate(`/session/${encodeURIComponent(picked.id)}`);
-        // See handleSelectSession: keep focus on the persistent keyboard input
-        // until the selected surface can receive it.
-        if (isCoarse) {
-          if (picked.tool === "claude" && picked.view !== "structured") {
-            closeKeyboardProxy();
-          } else if (webSettings.autoOpenKeyboard) {
-            focusKeyboardProxy();
-            if (picked.view === "structured") setPendingTerminalFocus("composer");
-          }
-        } else {
+  const handleSelectWorkspace = (workspace: Workspace) => {
+    const picked =
+      workspace.sessions.length === 1
+        ? (workspace.sessions[0] ?? null)
+        : groupedParentNavigationSession(workspace.sessions, activeSessionId);
+    if (picked) {
+      transitionKeyboardProxy(picked.id);
+      navigate(`/session/${encodeURIComponent(picked.id)}`);
+      // See handleSelectSession: keep focus on the persistent keyboard input
+      // until the selected surface can receive it.
+      if (isCoarse) {
+        if (picked.tool === "claude" && picked.view !== "structured") {
+          closeKeyboardProxy();
+        } else if (webSettings.autoOpenKeyboard) {
           focusKeyboardProxy();
-          focusAgentInput(picked);
+          if (picked.view === "structured") setPendingTerminalFocus("composer");
         }
       } else {
-        transitionKeyboardProxy(null);
-        navigate("/");
+        focusKeyboardProxy();
+        focusAgentInput(picked);
       }
+    } else {
+      transitionKeyboardProxy(null);
+      navigate("/");
     }
     if (window.innerWidth < 768) {
       setSidebarOpen(false);
@@ -1582,17 +1581,12 @@ function AppContent({
   // sourced from the same sidebar model the user sees so jump-to-next follows
   // the visible order under any sort or axis.
   const attentionJump = useMemo(() => {
-    const orderedIds: string[] = [];
+    const orderedSessions = sidebarSessionsInDisplayOrder(sidebarGroups);
     const attention = new Set<string>();
-    for (const g of sidebarGroups) {
-      for (const v of g.workspaces) {
-        for (const s of v.workspace.sessions) {
-          orderedIds.push(s.id);
-          if (sessionNeedsAttention(s)) attention.add(s.id);
-        }
-      }
+    for (const session of orderedSessions) {
+      if (sessionNeedsAttention(session)) attention.add(session.id);
     }
-    return { orderedIds, attention };
+    return { orderedIds: orderedSessions.map((session) => session.id), attention };
   }, [sidebarGroups]);
 
   const handleJumpToAttention = useCallback(() => {

@@ -13,6 +13,8 @@ interface MockSession {
   project_path: string;
   branch: string | null;
   status?: string;
+  created_at?: string;
+  group_path?: string;
 }
 
 const ROW_TAG_SCHEMA = [
@@ -65,11 +67,11 @@ async function mockApis(
           id: s.id,
           title: s.title,
           project_path: s.project_path,
-          group_path: s.project_path,
+          group_path: s.group_path ?? s.project_path,
           tool: "claude",
           status: s.status ?? "Idle",
           yolo_mode: false,
-          created_at: new Date().toISOString(),
+          created_at: s.created_at ?? "2025-01-01T00:00:00Z",
           last_accessed_at: null,
           last_error: null,
           branch: s.branch,
@@ -248,6 +250,7 @@ test.describe("Sidebar multi-session (#956)", () => {
         project_path: "/tmp/agent-of-empires",
         branch: "feature/shared-worktree",
         status: "Running",
+        created_at: "2025-01-01T00:00:00Z",
       },
       {
         id: "sess-b",
@@ -255,6 +258,7 @@ test.describe("Sidebar multi-session (#956)", () => {
         project_path: "/tmp/agent-of-empires",
         branch: "feature/shared-worktree",
         status: "Idle",
+        created_at: "2025-01-02T00:00:00Z",
       },
     ]);
     await page.setViewportSize({ width: 1280, height: 720 });
@@ -264,12 +268,19 @@ test.describe("Sidebar multi-session (#956)", () => {
     const parent = page.getByTestId("sidebar-session-row");
     await expect(parent).toHaveCount(1);
     await expect(parent).toContainText("feature/shared-worktree");
-    await expect(parent).toContainText("2 sessions");
-    // Parent navigation keeps the existing running-session preference.
-    await expect(parent).toHaveAttribute("href", /\/session\/sess-a$/);
+    const count = parent.getByTestId("sidebar-session-count");
+    await expect(count).toHaveText("2");
+    await expect(count).toHaveAttribute("title", "2 sessions");
+    await expect(count).toHaveAccessibleName("2 sessions");
+    await expect(parent).not.toContainText("2 sessions");
+    await expect(parent.getByTestId("sidebar-session-row-tag")).toHaveCount(0);
+    await expect(parent).toHaveAttribute("href", /\/session\/sess-b$/);
 
     const children = page.getByTestId("sidebar-session-child");
     await expect(children).toHaveCount(2);
+    await expect
+      .poll(() => children.evaluateAll((rows) => rows.map((row) => row.getAttribute("data-session-id"))))
+      .toEqual(["sess-b", "sess-a"]);
     await expect(page.getByTestId("sidebar-session-children")).toContainText("Creator integration");
     await expect(page.getByTestId("sidebar-session-children")).toContainText("Independent reviewer");
 
@@ -279,7 +290,87 @@ test.describe("Sidebar multi-session (#956)", () => {
 
     await expect(page).toHaveURL(/\/session\/sess-b$/);
     await expect(idleSibling).toHaveAttribute("aria-current", "page");
+    await expect(parent).toHaveAttribute("href", /\/session\/sess-b$/);
+
+    const runningSibling = page.locator('[data-testid="sidebar-session-child"][data-session-id="sess-a"]');
+    await runningSibling.click();
+    await expect(page).toHaveURL(/\/session\/sess-a$/);
     await expect(parent).toHaveAttribute("href", /\/session\/sess-a$/);
+    await parent.click();
+    await expect(page).toHaveURL(/\/session\/sess-a$/);
+
+    await page.goto("/");
+    await expect(parent).toHaveAttribute("href", /\/session\/sess-b$/);
+    await parent.click();
+    await expect(page).toHaveURL(/\/session\/sess-b$/);
+  });
+
+  test("jump-to-attention follows grouped child display order", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-older",
+        title: "Creator integration",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Waiting",
+        created_at: "2025-01-01T00:00:00Z",
+      },
+      {
+        id: "sess-newest",
+        title: "Independent reviewer",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Error",
+        created_at: "2025-01-02T00:00:00Z",
+      },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+
+    const children = page.getByTestId("sidebar-session-child");
+    await expect
+      .poll(() => children.evaluateAll((rows) => rows.map((row) => row.getAttribute("data-session-id"))))
+      .toEqual(["sess-newest", "sess-older"]);
+    await page.keyboard.press("a");
+    await expect(page).toHaveURL(/\/session\/sess-newest$/);
+  });
+
+  test("group-sliced parent navigation stays within the rendered session slice", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-older",
+        title: "Creator integration",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Running",
+        created_at: "2025-01-01T00:00:00Z",
+        group_path: "creator",
+      },
+      {
+        id: "sess-newest",
+        title: "Independent reviewer",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Idle",
+        created_at: "2025-01-02T00:00:00Z",
+        group_path: "review",
+      },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+
+    const axisToggle = page.getByTestId("sidebar-axis-toggle");
+    await axisToggle.click();
+    await expect(axisToggle).toHaveAttribute("data-axis", "org");
+    await axisToggle.click();
+    await expect(axisToggle).toHaveAttribute("data-axis", "group");
+
+    const reviewRow = page.getByTestId("sidebar-session-row").filter({ hasText: "Independent reviewer" });
+    await expect(reviewRow).toHaveAttribute("href", /\/session\/sess-newest$/);
+    await reviewRow.click();
+    await expect(page).toHaveURL(/\/session\/sess-newest$/);
   });
 
   test("distinct branches render their own rows (regression guard)", async ({ page }) => {
