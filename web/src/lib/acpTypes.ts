@@ -702,29 +702,20 @@ export interface AcpState {
    *  silently lose actions to a network blip. Cleared on the next
    *  successful interaction. */
   lastError: string | null;
-  /** True between sending a user prompt and receiving the
-   *  `Stopped { reason: "prompt_complete" }` event. Drives the global
-   *  "working" spinner so the UI feels alive even when the agent
-   *  isn't streaming text or running a tool yet.
-   *
-   *  Derived from `pendingUserPromptSeq > lastStoppedSeq`; never
-   *  written directly. Keeping it on the state shape (instead of
-   *  exporting a selector) lets all the existing `state.turnActive`
-   *  reads stay unchanged. The counter pair is the source of truth so
-   *  a late `Stopped` from a prior turn can't clobber a fresh
-   *  follow-up that's already incremented `pendingUserPromptSeq`.
-   *  See #1170. */
+  /** True while either a user-prompt turn or an agent-initiated foreground
+   *  epoch is active. Drives the global working UI. */
   turnActive: boolean;
-  /** Monotonic count of user prompts the client has dispatched (either
-   *  via the optimistic `user_prompt` action or via a server-confirmed
-   *  `UserPromptSent` echo that didn't match an outstanding optimistic
-   *  row). Source of truth for `turnActive`; never decremented. */
+  /** Monotonic user-prompt claim count from #1170. Agent activity never
+   *  changes this counter, which is also the stop-escalation turn token. */
   pendingUserPromptSeq: number;
-  /** Snapshot of `pendingUserPromptSeq` at the moment the most recent
-   *  `Stopped` (or `AgentStartupError`) arrived. `turnActive` derives
-   *  to false only when no further prompt has bumped
-   *  `pendingUserPromptSeq` past this snapshot. */
+  /** Number of user-prompt claims retired by terminal events. */
   lastStoppedSeq: number;
+  /** Foreground work started by the agent while no user prompt is active.
+   *  This lifecycle is separate because the daemon lets a real prompt
+   *  supersede it without emitting an extra `Stopped`. Cached with the event
+   *  cursor so a warm reload stays active; any newer durable terminal is
+   *  replayed and closes it. */
+  agentInitiatedTurnActive: boolean;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,
    *  plus the agent's currently-active mode id. Empty until the
    *  agent reports them; the picker falls back to the hard-coded
@@ -974,6 +965,13 @@ export interface QueuedPrompt {
   attachments?: PromptAttachmentInput[];
 }
 
+export type PromptIntent = "new_turn" | "steer";
+
+/** Only prompts that start a daemon turn create a terminal-accounting claim. */
+export function promptCreatesTurnClaim(intent: PromptIntent): boolean {
+  return intent === "new_turn";
+}
+
 export interface ActivityRow {
   id: string;
   kind:
@@ -1011,6 +1009,9 @@ export interface ActivityRow {
    *  Set from the optimistic local preview on send, or from the
    *  server `UserPromptSent` refs on replay. See #1000 / #965. */
   attachments?: AcpAttachment[];
+  /** Transient lifecycle intent used to correlate a prompt with its echo
+   *  and possible rejection. Never written to the persisted state cache. */
+  promptIntent?: PromptIntent;
   /** Structured completion payload on `tool_complete` / `tool_error`
    *  rows: media/resource blocks the card renders richly when the agent
    *  ships them only at completion. Absent for text-only completions
@@ -1072,6 +1073,7 @@ export function emptyAcpState(): AcpState {
     turnActive: false,
     pendingUserPromptSeq: 0,
     lastStoppedSeq: 0,
+    agentInitiatedTurnActive: false,
     availableModes: [],
     currentModeId: null,
     availableCommands: [],
@@ -1102,11 +1104,8 @@ export function emptyAcpState(): AcpState {
   };
 }
 
-/** Per-turn state resets shared by every "a new user turn started"
- *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
- *  Mutates `next` in place; the caller has already appended the
- *  activity row and bumped `pendingUserPromptSeq`. */
-/** Whether a `UserPromptSent` is a message steered into the turn already
+/** Whether a replay-only prompt is a message steered into the user-prompt
+ *  turn already
  *  running rather than the start of a new one (#2805).
  *
  *  The daemon injects a mid-turn prompt via `_session/steering` instead of
@@ -1116,18 +1115,45 @@ export function emptyAcpState(): AcpState {
  *  turn's single `Stopped` still has to see the output flag and the
  *  pending-cancel state the turn actually accumulated.
  *
- *  Takes the pre-event state, since the arms bump `pendingUserPromptSeq`
- *  (which feeds `isTurnActive`) before they reach the reset.
+ *  The optimistic path records the composer's send-time intent on its row;
+ *  this fallback is only for replay/no-placeholder events and therefore
+ *  reads the pre-event user-prompt lifecycle.
  */
 function isSteeredContinuation(state: AcpState): boolean {
-  return state.turnActive && !!state.promptCapabilities?.steering;
+  return isTurnActive(state) && !!state.promptCapabilities?.steering;
 }
 
+function syncTurnActive(next: AcpState): void {
+  next.turnActive = isTurnActive(next) || next.agentInitiatedTurnActive;
+}
+
+function clearPromptIntents(next: AcpState): void {
+  if (!next.activity.some((row) => row.promptIntent !== undefined)) return;
+  next.activity = next.activity.map((row) => {
+    if (row.promptIntent === undefined) return row;
+    const cleared = { ...row };
+    delete cleared.promptIntent;
+    return cleared;
+  });
+}
+
+function retireActiveLifecycle(next: AcpState): void {
+  if (isTurnActive(next)) {
+    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
+  } else {
+    next.agentInitiatedTurnActive = false;
+  }
+  clearPromptIntents(next);
+  syncTurnActive(next);
+}
+
+/** Per-turn state resets shared by every event that starts a new user turn. */
 function applyNewTurnResets(next: AcpState): void {
+  next.agentInitiatedTurnActive = false;
   next.assistantMessage = "";
   next.startupError = null;
   next.lastError = null;
-  next.turnActive = isTurnActive(next);
+  syncTurnActive(next);
   // A fresh turn supersedes any stale "Stopping..." state from a prior
   // turn's cancel. See #1727.
   next.cancelling = false;
@@ -1182,6 +1208,38 @@ function applyNewTurnResets(next: AcpState): void {
   next.rateLimit = null;
 }
 
+/** Open one foreground turn epoch when the agent resumes useful work without
+ *  a `UserPromptSent`. These are the same three positive work signals the
+ *  server maps to `Status::Running`; phase endings, completions, metadata,
+ *  and background-agent telemetry deliberately never call this helper.
+ *  Worker stop/restart states reject trailing activity until a fresh worker
+ *  assignment clears their lifecycle flag, matching the server's guard.
+ *
+ *  Repeated activity while the epoch is already active is idempotent. This
+ *  is not a user-owned turn, so it intentionally skips
+ *  {@link applyNewTurnResets} and the user-prompt counters. */
+function armAgentInitiatedTurn(next: AcpState): void {
+  if (
+    isTurnActive(next) ||
+    next.agentInitiatedTurnActive ||
+    next.workerStopped ||
+    next.workerRestarting ||
+    next.workerIdleStopped
+  ) {
+    return;
+  }
+  next.agentInitiatedTurnActive = true;
+  syncTurnActive(next);
+}
+
+/** The Claude ACP adapter emits compaction terminals as bare message chunks
+ *  with no metadata. They remain visible transcript output, but are lifecycle
+ *  tails rather than evidence that the agent started a new foreground turn.
+ *  Keep this aligned with the backend's compaction lifecycle classifier. */
+function isCompactionTerminalChunk(text: string): boolean {
+  return text.includes("Compacting completed.") || text.includes("Compacting failed");
+}
+
 /** Pure reducer. Returns a new state; never mutates the input.
  *  Drops frames whose seq is not strictly greater than `state.lastSeq`
  *  so reconnect/replay can re-deliver buffered frames without
@@ -1195,6 +1253,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   const event = frame.event;
   if (typeof event === "string") {
     if (event === "ThinkingStarted") {
+      armAgentInitiatedTurn(next);
       next.thinking = true;
       next.turnHasOutput = true;
     } else if (event === "ThinkingEnded") {
@@ -1287,6 +1346,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallStarted" in event) {
+    armAgentInitiatedTurn(next);
     // Copy so the preserved `raw_name` (the immutable wire tool identity)
     // stamped here can't leak back onto the shared event object. A later
     // ToolCallUpdated overwrites `name` with the title but leaves
@@ -1645,6 +1705,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("AgentMessageChunk" in event) {
+    if (!isCompactionTerminalChunk(event.AgentMessageChunk.text)) {
+      armAgentInitiatedTurn(next);
+    }
     next.assistantMessage = next.assistantMessage + event.AgentMessageChunk.text;
     // Visible assistant text means the agent is answering, not thinking.
     // A later reasoning block re-sets `thinking` via ThinkingStarted. See
@@ -1663,9 +1726,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Final marker; nothing to mutate, but reset the inflight tool just
     // in case the agent forgot to emit a completion.
     //
-    // `turnActive` is derived from `pendingUserPromptSeq > lastStoppedSeq`;
-    // we advance `lastStoppedSeq` by one (capped at `pendingUserPromptSeq`)
-    // so this Stopped only retires ONE turn's worth of activity. If a
+    // A user-prompt lifecycle advances `lastStoppedSeq` by one (capped at
+    // `pendingUserPromptSeq`); an agent-initiated lifecycle clears its
+    // separate flag. Thus this Stopped retires one owner. If a
     // fresh user prompt landed client-side between the turn this Stopped
     // is closing and now, `pendingUserPromptSeq` was already bumped past
     // the cap and `turnActive` stays true. Without this, a late Stopped
@@ -1686,8 +1749,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // self-healing clear: a dropped completion marker, a killed worker
     // and a user cancel all arrive here. See #3219.
     next.compacting = false;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    retireActiveLifecycle(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
     // ends. The monitor firing makes the agent act (a tool call after the
     // arm, tracked by `monitorWorkSeen`); the badge then retires on the next
@@ -1777,14 +1839,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // UserPromptSent, so this check is O(1) instead of walking the
     // full activity array on every Stopped.
     //
-    // `state.turnActive` is read on the PRE-event state. Under the
-    // counter derivation it means "at least one outstanding prompt
-    // hasn't been retired yet," which is exactly what we want: it
-    // skips spurious Stopped frames (no open turn to attribute the
-    // notice to) and fires for the turn this Stopped is actually
-    // retiring. In the race case, `turnHasOutput` still reflects the
-    // turn being retired because UserPromptSent (which resets it) for
-    // the follow-up hasn't been applied yet.
+    // `state.turnActive` is read on the PRE-event state so spurious idle
+    // terminals are ignored and a real user or agent-initiated epoch can
+    // receive the fallback. In the late-Stopped race, `turnHasOutput` still
+    // reflects the lifecycle being retired because the follow-up's full
+    // reset waits for its server echo.
     if (state.turnActive && !state.turnHasOutput) {
       next.activity = pushActivity(next.activity, {
         id: `empty-${frame.seq}`,
@@ -1806,8 +1865,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.inFlightTool = null;
     sweepOpenToolCalls(next, frame.seq);
     next.agentUnresponsive = false;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    retireActiveLifecycle(next);
     return next;
   }
   if ("AgentStartupError" in event) {
@@ -1821,8 +1879,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // by one so a startup failure for the prior turn doesn't kill the
     // spinner for a freshly-typed follow-up the user has already
     // submitted. See #1170.
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    retireActiveLifecycle(next);
     return next;
   }
   if ("PromptRuntimeError" in event) {
@@ -1866,14 +1923,18 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const matchIdx = next.activity.findIndex(
       (r) => r.kind === "user_prompt" && r.text === text && !r.id.startsWith("user-seq-"),
     );
+    const promptIntent: PromptIntent =
+      matchIdx >= 0
+        ? (next.activity[matchIdx]?.promptIntent ?? "new_turn")
+        : isSteeredContinuation(state)
+          ? "steer"
+          : "new_turn";
     if (matchIdx >= 0) {
       // Optimistic-match path: promote the placeholder's id. The
-      // client's `user_prompt` action already bumped
-      // `pendingUserPromptSeq`, so we don't bump again here. The
-      // per-turn resets below STILL apply: `turnHasOutput`, the
-      // worker banners, and the wakeup countdown all reset on every
-      // server-confirmed UserPromptSent regardless of which branch
-      // promoted the row. See #1170.
+      // client's `user_prompt` action already applied the intent's claim
+      // accounting, so we don't apply it again here. The row keeps its
+      // transient intent until the turn stops or the daemon rejects the
+      // message.
       const match = next.activity[matchIdx];
       if (match) {
         const updated = next.activity.slice();
@@ -1895,20 +1956,21 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       // No optimistic row matched: this is a server-confirmed prompt
       // the client didn't dispatch (replay path, server-initiated, or
       // user action without optimistic local dispatch). Append a fresh
-      // row and bump the prompt counter so `turnActive` derives true.
-      // The optimistic-match branch above is reached when the client's
-      // `user_prompt` action already bumped the counter; bumping again
-      // here would double-count. See #1170.
+      // row. Replay derives the same lifecycle intent from the pre-event
+      // user-prompt lifecycle that the composer used at send time.
       next.activity = pushActivity(next.activity, {
         id: `user-seq-${frame.seq}`,
         kind: "user_prompt",
         text,
         attachments: serverAttachments.length > 0 ? serverAttachments : undefined,
+        promptIntent,
         at: new Date().toISOString(),
       });
-      next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+      if (promptCreatesTurnClaim(promptIntent)) {
+        next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+      }
     }
-    if (!isSteeredContinuation(state)) {
+    if (promptIntent === "new_turn") {
       applyNewTurnResets(next);
     }
     return next;
@@ -1920,6 +1982,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // markdown (agent-visible body / fallback); `diffComments` carries
     // the structured payload the runtime hands to the transcript card.
     const p = event.UserDiffCommentsPrompt;
+    const promptIntent: PromptIntent = isSteeredContinuation(state) ? "steer" : "new_turn";
     next.activity = pushActivity(next.activity, {
       id: `user-seq-${frame.seq}`,
       kind: "user_diff_comments",
@@ -1930,10 +1993,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         isMultiRepo: p.isMultiRepo,
         comments: p.comments,
       },
+      promptIntent,
       at: new Date().toISOString(),
     });
-    next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
-    if (!isSteeredContinuation(state)) {
+    if (promptCreatesTurnClaim(promptIntent)) {
+      next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
       applyNewTurnResets(next);
     }
     return next;
@@ -1987,7 +2051,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // See #3094 / #3087.
     if (next.queuedPrompts.length > 0 && next.pendingUserPromptSeq > next.lastStoppedSeq) {
       next.lastStoppedSeq = next.pendingUserPromptSeq;
-      next.turnActive = isTurnActive(next);
+      syncTurnActive(next);
     }
     return next;
   }
@@ -2140,14 +2204,32 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     };
     const REJECTED_PROMPTS_CAP = 5;
     next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(-REJECTED_PROMPTS_CAP);
-    // Retire the spinner for this rejected submission so the composer
-    // unlocks. `pendingUserPromptSeq` was bumped by the optimistic
-    // dispatch; advancing `lastStoppedSeq` by one (capped) gives this
-    // rejection the same turn-retirement semantics as a Stopped without
-    // letting it spill into a different turn's bookkeeping. See #1170
-    // for the cap rationale.
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    const rejectedRowIdx = next.activity.findLastIndex(
+      (row) =>
+        (row.kind === "user_prompt" || row.kind === "user_diff_comments") &&
+        row.text === event.PromptRejected.text &&
+        row.promptIntent !== undefined,
+    );
+    const rejectedIntent = rejectedRowIdx >= 0 ? next.activity[rejectedRowIdx]?.promptIntent : undefined;
+    if (rejectedRowIdx >= 0) {
+      const activity = next.activity.slice();
+      const row = activity[rejectedRowIdx];
+      if (row) {
+        const cleared = { ...row };
+        delete cleared.promptIntent;
+        activity[rejectedRowIdx] = cleared;
+        next.activity = activity;
+      }
+    }
+    // A rejected new-turn prompt owns a claim but will never receive a
+    // Stopped. A rejected steer owns no claim; its original turn remains
+    // active and will emit the only Stopped for that lifecycle. Missing
+    // intent comes from a pre-fix cache, so preserve the prior retirement
+    // behavior for backward compatibility.
+    if (rejectedIntent === undefined || promptCreatesTurnClaim(rejectedIntent)) {
+      next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
+    }
+    syncTurnActive(next);
     return next;
   }
   if ("BackgroundAgentLaunched" in event) {
@@ -2422,15 +2504,14 @@ function sweepOpenToolCalls(next: AcpState, frameSeq: number): void {
   if (drained) next.toolOutputs = outputs;
 }
 
-/** Derived `turnActive` from the prompt / stop seq counters. Exported
- *  so any new consumer can compute it from the counters directly; the
- *  reducer also calls this to keep `state.turnActive` in lockstep so
- *  existing `state.turnActive` reads stay correct. See #1170.
+/** Whether a user-prompt lifecycle is active. Exported so send-time prompt
+ *  routing can distinguish a real steering continuation from a separate
+ *  agent-initiated epoch. See #1170.
  *
  *  Invariant: `lastStoppedSeq <= pendingUserPromptSeq` always holds.
- *  Both counters start at 0; `pendingUserPromptSeq` increments by one
- *  on every dispatched user prompt, and `lastStoppedSeq` advances by
- *  one per `Stopped` / `AgentStartupError` but is capped at
+ *  Both counters start at 0; `pendingUserPromptSeq` increments for every
+ *  dispatched user prompt. `lastStoppedSeq` advances by one per terminal
+ *  that owns a user-prompt claim, capped at
  *  `pendingUserPromptSeq` so spurious extra Stopped frames cannot
  *  poison a future turn. */
 export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "lastStoppedSeq">): boolean {
@@ -2465,7 +2546,7 @@ export function isCompactionReminderDue(
  *  Used by the localStorage loader after the #1170 schema change: pre-
  *  schema persisted entries have no counters, so we backfill from the
  *  cached `turnActive` boolean (true → one outstanding prompt, false →
- *  fully retired) and re-derive `turnActive` from the counters. */
+ *  fully retired). */
 export function normaliseTurnCounters(
   state: AcpState & {
     oldestSeq?: number;
@@ -2485,6 +2566,8 @@ export function normaliseTurnCounters(
     typeof state.pendingUserPromptSeq === "number" ? state.pendingUserPromptSeq : state.turnActive ? 1 : 0;
   const lastStoppedSeq =
     typeof state.lastStoppedSeq === "number" ? state.lastStoppedSeq : state.turnActive ? 0 : pendingUserPromptSeq;
+  const agentInitiatedTurnActive =
+    typeof state.agentInitiatedTurnActive === "boolean" ? state.agentInitiatedTurnActive : false;
   // Pre-#1196 persisted entries lack rejectedPrompts / agentUnresponsive;
   // backfill so the reducer and renderers see well-typed values instead
   // of `undefined` (which crashes RejectedPromptsStrip's `.length` read).
@@ -2530,6 +2613,7 @@ export function normaliseTurnCounters(
     compactionReminderDismissed,
     pendingUserPromptSeq,
     lastStoppedSeq,
-    turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq }),
+    agentInitiatedTurnActive,
+    turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq }) || agentInitiatedTurnActive,
   };
 }

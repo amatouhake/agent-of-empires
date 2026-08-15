@@ -42,6 +42,7 @@ function withOptimisticPrompt(state: AcpState, text: string): AcpState {
       id: `user-${Date.now()}-${state.activity.length}`,
       kind: "user_prompt",
       text,
+      promptIntent: "new_turn",
       at: new Date().toISOString(),
     }),
     pendingUserPromptSeq,
@@ -615,6 +616,29 @@ describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
     expect(next.workerRestarting).toBe(false);
     expect(next.agentUnresponsive).toBe(false);
     expect(next.turnActive).toBe(true);
+  });
+
+  it("does not add a turn claim when diff comments steer the active turn", () => {
+    let state: AcpState = {
+      ...emptyAcpState(),
+      promptCapabilities: { image: false, audio: false, embeddedContext: false, steering: true },
+      pendingUserPromptSeq: 1,
+      turnActive: true,
+      assistantMessage: "in progress",
+      turnHasOutput: true,
+    };
+    state = applyEvent(state, diffCommentsFrame(1));
+    expect(state.pendingUserPromptSeq).toBe(1);
+    expect(state.assistantMessage).toBe("in progress");
+    expect(state.turnHasOutput).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.lastStoppedSeq).toBe(1);
+    expect(state.turnActive).toBe(false);
   });
 
   it("counts as a prior user turn for SessionContextReset (#1123)", () => {
@@ -2151,11 +2175,10 @@ describe("applyEvent / AgentSwitched", () => {
   });
 });
 
-describe("turnActive derivation from prompt/stop counters (#1170)", () => {
-  // `turnActive` derives from `pendingUserPromptSeq > lastStoppedSeq`.
-  // The boolean field is kept on `AcpState` as a memoised alias so
-  // existing `state.turnActive` reads stay correct, but the counters
-  // are the source of truth a late `Stopped` cannot clobber.
+describe("turn lifecycle accounting (#1170)", () => {
+  // User-prompt activity derives from the counter pair so a late Stopped
+  // cannot clobber it. Aggregate turnActive also includes the separate
+  // agent-initiated epoch.
 
   it("isTurnActive flips on / off when counters cross", () => {
     expect(isTurnActive({ pendingUserPromptSeq: 2, lastStoppedSeq: 1 })).toBe(true);
@@ -2184,6 +2207,345 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     expect(state.turnActive).toBe(false);
   });
 
+  it("opens a new active epoch for agent activity after a completed turn", () => {
+    const activityEvents: Array<{ label: string; event: AcpFrame["event"] }> = [
+      { label: "thinking", event: "ThinkingStarted" },
+      { label: "assistant output", event: { AgentMessageChunk: { text: "resuming" } } },
+      {
+        label: "tool start",
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: "agent-tool",
+              name: "Terminal",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-01-01T00:00:00Z",
+            },
+          },
+        },
+      },
+    ];
+
+    for (const { label, event } of activityEvents) {
+      let state = applyEvent(emptyAcpState(), {
+        session_id: "s-1",
+        seq: 1,
+        event: { UserPromptSent: { text: "start" } },
+      });
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 2,
+        event: { Stopped: { reason: "prompt_complete" } },
+      });
+      expect(state.turnActive, label).toBe(false);
+
+      state = applyEvent(state, { session_id: "s-1", seq: 3, event });
+      expect(state.turnActive, label).toBe(true);
+      expect(state.agentInitiatedTurnActive, label).toBe(true);
+      expect(state.pendingUserPromptSeq, label).toBe(1);
+      expect(state.lastStoppedSeq, label).toBe(1);
+
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 4,
+        event: { AgentMessageChunk: { text: "still working" } },
+      });
+      expect(state.pendingUserPromptSeq, label).toBe(1);
+
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 5,
+        event: { Stopped: { reason: "inferred_prompt_complete" } },
+      });
+      expect(state.turnActive, label).toBe(false);
+      expect(state.agentInitiatedTurnActive, label).toBe(false);
+    }
+  });
+
+  it("lets a real prompt supersede an agent epoch without terminal debt", async () => {
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "first" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: "ThinkingStarted",
+    });
+    expect(state.agentInitiatedTurnActive).toBe(true);
+    expect(state.pendingUserPromptSeq).toBe(1);
+
+    state = acpHookReducer(state, {
+      kind: "user_prompt",
+      text: "take over",
+      intent: "new_turn",
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: { UserPromptSent: { text: "take over" } },
+    });
+    expect(state.agentInitiatedTurnActive).toBe(false);
+    expect(state.pendingUserPromptSeq).toBe(2);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 5,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.turnActive).toBe(false);
+    expect(state.pendingUserPromptSeq).toBe(2);
+    expect(state.lastStoppedSeq).toBe(2);
+  });
+
+  it("uses send-time intent to distinguish takeover from steering resets", async () => {
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    const capabilities: AcpFrame = {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        PromptCapabilities: {
+          image: false,
+          audio: false,
+          embedded_context: false,
+          steering: true,
+        },
+      },
+    };
+
+    let takeover = applyEvent(emptyAcpState(), capabilities);
+    takeover = applyEvent(takeover, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AgentMessageChunk: { text: "between prompts" } },
+    });
+    takeover = acpHookReducer(takeover, {
+      kind: "user_prompt",
+      text: "new work",
+      intent: "new_turn",
+    });
+    expect(takeover.assistantMessage).toBe("");
+    expect(takeover.agentInitiatedTurnActive).toBe(false);
+    takeover = applyEvent(takeover, {
+      session_id: "s-1",
+      seq: 3,
+      event: { UserPromptSent: { text: "new work" } },
+    });
+    expect(takeover.turnHasOutput).toBe(false);
+
+    let replayedTakeover = applyEvent(emptyAcpState(), capabilities);
+    replayedTakeover = applyEvent(replayedTakeover, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AgentMessageChunk: { text: "replayed between-prompt work" } },
+    });
+    replayedTakeover = applyEvent(replayedTakeover, {
+      session_id: "s-1",
+      seq: 3,
+      event: { UserPromptSent: { text: "replayed new work" } },
+    });
+    expect(replayedTakeover.assistantMessage).toBe("");
+    expect(replayedTakeover.agentInitiatedTurnActive).toBe(false);
+
+    let steered = applyEvent(emptyAcpState(), capabilities);
+    steered = applyEvent(steered, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "start" } },
+    });
+    steered = applyEvent(steered, {
+      session_id: "s-1",
+      seq: 3,
+      event: { AgentMessageChunk: { text: "in progress" } },
+    });
+    steered = acpHookReducer(steered, {
+      kind: "user_prompt",
+      text: "course correct",
+      intent: "steer",
+    });
+    expect(steered.assistantMessage).toBe("in progress");
+    expect(steered.turnHasOutput).toBe(true);
+    expect(steered.pendingUserPromptSeq).toBe(1);
+    expect(steered.lastStoppedSeq).toBe(0);
+    expect(steered.turnActive).toBe(true);
+    const locallyRejectedSteer = acpHookReducer(steered, {
+      kind: "prompt_send_rejected",
+      intent: "steer",
+    });
+    expect(locallyRejectedSteer.pendingUserPromptSeq).toBe(1);
+    expect(locallyRejectedSteer.lastStoppedSeq).toBe(0);
+    expect(locallyRejectedSteer.turnActive).toBe(true);
+    steered = applyEvent(steered, {
+      session_id: "s-1",
+      seq: 4,
+      event: { UserPromptSent: { text: "course correct" } },
+    });
+    expect(steered.assistantMessage).toBe("in progress");
+    expect(steered.turnHasOutput).toBe(true);
+    expect(steered.pendingUserPromptSeq).toBe(1);
+
+    steered = applyEvent(steered, {
+      session_id: "s-1",
+      seq: 5,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(steered.pendingUserPromptSeq).toBe(1);
+    expect(steered.lastStoppedSeq).toBe(1);
+    expect(steered.turnActive).toBe(false);
+  });
+
+  it("keeps one claim across multiple optimistic steering messages", async () => {
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    let state: AcpState = {
+      ...emptyAcpState(),
+      promptCapabilities: { image: false, audio: false, embeddedContext: false, steering: true },
+      pendingUserPromptSeq: 1,
+      turnActive: true,
+    };
+
+    for (const [index, text] of ["steer 1", "steer 2", "steer 3"].entries()) {
+      state = acpHookReducer(state, { kind: "user_prompt", text, intent: "steer" });
+      expect(state.pendingUserPromptSeq, text).toBe(1);
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: index + 1,
+        event: { UserPromptSent: { text } },
+      });
+      expect(state.pendingUserPromptSeq, `${text} echo`).toBe(1);
+    }
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.lastStoppedSeq).toBe(1);
+    expect(state.turnActive).toBe(false);
+  });
+
+  it("classifies a replay-only follow-up from the pre-event user lifecycle", () => {
+    let state: AcpState = {
+      ...emptyAcpState(),
+      promptCapabilities: { image: false, audio: false, embeddedContext: false, steering: true },
+    };
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "start" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "replayed steer" } },
+    });
+    expect(state.pendingUserPromptSeq).toBe(1);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.lastStoppedSeq).toBe(1);
+    expect(state.turnActive).toBe(false);
+  });
+
+  it("does not rearm terminal compaction chunks after Stopped", () => {
+    const terminalChunks = [
+      "\n\nCompacting failed: API Error: Request was aborted.",
+      "\n\nCompacting failed: Not enough messages to compact.",
+      "\n\nCompacting failed.",
+      "\n\nCompacting completed.\n",
+    ];
+
+    for (const text of terminalChunks) {
+      let state = applyEvent(emptyAcpState(), {
+        session_id: "s-1",
+        seq: 1,
+        event: { UserPromptSent: { text: "/compact" } },
+      });
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 2,
+        event: { AgentMessageChunk: { text: "Compacting..." } },
+      });
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 3,
+        event: "ConversationCompactionStarted",
+      });
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 4,
+        event: { Stopped: { reason: "prompt_complete" } },
+      });
+      expect(state.turnActive, text).toBe(false);
+      expect(state.compacting, text).toBe(false);
+
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 5,
+        event: { AgentMessageChunk: { text } },
+      });
+
+      expect(state.turnActive, text).toBe(false);
+      expect(state.pendingUserPromptSeq, text).toBe(1);
+      expect(state.lastStoppedSeq, text).toBe(1);
+      expect(state.assistantMessage, text).toContain(text);
+    }
+  });
+
+  it("does not open an active epoch for trailing or worker-stopped frames", () => {
+    const trailingEvents: Array<{
+      label: string;
+      stoppedReason: string;
+      event: AcpFrame["event"];
+    }> = [
+      { label: "thinking end", stoppedReason: "prompt_complete", event: "ThinkingEnded" },
+      {
+        label: "tool completion",
+        stoppedReason: "prompt_complete",
+        event: {
+          ToolCallCompleted: {
+            tool_call_id: "late-tool",
+            is_error: false,
+            content: "done",
+          },
+        },
+      },
+      {
+        label: "activity after deliberate worker stop",
+        stoppedReason: "user_stopped",
+        event: { AgentMessageChunk: { text: "late output" } },
+      },
+    ];
+
+    for (const { label, stoppedReason, event } of trailingEvents) {
+      let state = applyEvent(emptyAcpState(), {
+        session_id: "s-1",
+        seq: 1,
+        event: { UserPromptSent: { text: "start" } },
+      });
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 2,
+        event: { Stopped: { reason: stoppedReason } },
+      });
+      state = applyEvent(state, { session_id: "s-1", seq: 3, event });
+
+      expect(state.turnActive, label).toBe(false);
+      expect(state.pendingUserPromptSeq, label).toBe(1);
+      expect(state.lastStoppedSeq, label).toBe(1);
+    }
+  });
+
   it("late Stopped from prior turn does NOT clobber turnActive after a fresh follow-up", async () => {
     // The bug. Prior turn: pendingUserPromptSeq=1, lastStoppedSeq=0
     // (turnActive=true). User submits a follow-up before the prior
@@ -2207,6 +2569,7 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     state = acpHookReducer(state, {
       kind: "user_prompt",
       text: "follow-up",
+      intent: "new_turn",
     });
     expect(state.pendingUserPromptSeq).toBe(2);
     expect(state.turnActive).toBe(true);
@@ -2274,6 +2637,7 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     let state = acpHookReducer(emptyAcpState(), {
       kind: "user_prompt",
       text: "echo me",
+      intent: "new_turn",
     });
     expect(state.pendingUserPromptSeq).toBe(1);
     state = applyEvent(state, {

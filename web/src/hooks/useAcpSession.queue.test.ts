@@ -575,8 +575,86 @@ describe("useAcpSession drain race (#1144)", () => {
 
       expect(promptPostCount).toBe(expectedPosts);
       expect(result.current.state.queuedPrompts).toHaveLength(expectedQueued);
+
+      if (steering && !cancelling && !compacting) {
+        expect(result.current.state.pendingUserPromptSeq).toBe(1);
+        act(() => {
+          ws.onmessage?.({
+            data: JSON.stringify({
+              session_id: sessionId,
+              seq: 3,
+              event: { UserPromptSent: { text: "also check the tests" } },
+            }),
+          } as MessageEvent);
+        });
+        await flushAsync();
+        expect(result.current.state.pendingUserPromptSeq).toBe(1);
+
+        act(() => {
+          ws.onmessage?.({
+            data: JSON.stringify({
+              session_id: sessionId,
+              seq: 4,
+              event: { Stopped: { reason: "prompt_complete" } },
+            }),
+          } as MessageEvent);
+        });
+        await flushAsync();
+        expect(result.current.state.lastStoppedSeq).toBe(1);
+        expect(result.current.state.turnActive).toBe(false);
+      }
     },
   );
+
+  it("sends a prompt over an agent-initiated epoch as a fresh turn", async () => {
+    const sessionId = "sess-agent-epoch-takeover";
+    const { result } = renderHook(() => useAcpSession(sessionId));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: sessionId,
+          seq: 1,
+          event: {
+            PromptCapabilities: {
+              image: false,
+              audio: false,
+              embedded_context: false,
+              steering: true,
+            },
+          },
+        }),
+      } as MessageEvent);
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: sessionId,
+          seq: 2,
+          event: { AgentMessageChunk: { text: "between prompts" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.agentInitiatedTurnActive).toBe(true);
+    expect(result.current.state.pendingUserPromptSeq).toBe(0);
+
+    act(() => {
+      void result.current.sendPrompt("start a real turn");
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.queuedPrompts).toEqual([]);
+    expect(result.current.state.agentInitiatedTurnActive).toBe(false);
+    expect(result.current.state.pendingUserPromptSeq).toBe(1);
+    expect(result.current.state.assistantMessage).toBe("");
+  });
 
   it("drains the queue once the WS opens after an inactive-state enqueue (#1359)", async () => {
     const { result } = renderHook(() => useAcpSession("sess-drain-resume"));

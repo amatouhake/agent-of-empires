@@ -67,6 +67,23 @@ describe("useCancelEscalation (#2237)", () => {
     expect(forceEndTurn).not.toHaveBeenCalled();
   });
 
+  it("does not reset the local intent when activity keeps the same turn token", async () => {
+    for (const activity of ["agent activity", "steering follow-up"]) {
+      const { result, rerender, cancelPrompt, forceEndTurn } = setup({ turnSeq: 4 });
+      await act(async () => {
+        await result.current();
+      });
+      // Both kinds of activity re-render the consumer, but neither creates
+      // a daemon turn claim, so the user-prompt counter token stays fixed.
+      rerender({ sessionId: "s-1", turnSeq: 4, cancelling: false });
+      await act(async () => {
+        await result.current();
+      });
+      expect(cancelPrompt, activity).toHaveBeenCalledTimes(1);
+      expect(forceEndTurn, activity).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it("resets the local intent on a session switch without unmount", async () => {
     const { result, rerender, cancelPrompt, forceEndTurn } = setup({ sessionId: "s-1", turnSeq: 5 });
     await act(async () => {
