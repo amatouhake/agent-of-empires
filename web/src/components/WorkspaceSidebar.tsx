@@ -57,7 +57,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace } from "../lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "../lib/types";
 import { ProjectsSection } from "./ProjectsSection";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -75,6 +75,7 @@ import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
 import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
+import { aggregateSessionDisplay, groupedParentNavigationSession, sessionsInDisplayOrder } from "../lib/sessionDisplay";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { exceedsTouchSlop } from "../lib/longPress";
@@ -333,7 +334,7 @@ interface Props {
   activeSessionId?: string | null;
   open: boolean;
   onToggle: () => void;
-  onSelect: (workspaceId: string) => void;
+  onSelect: (workspace: Workspace) => void;
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
@@ -381,32 +382,6 @@ function statusRepresentativeCandidates(ws: Workspace, idleDecayWindowMs: number
   if (active.length > 0) return active;
   const errors = ws.sessions.filter((s) => s.status === "Error");
   return errors.length > 0 ? errors : ws.sessions;
-}
-
-function bestSession(
-  ws: Workspace,
-  idleDecayWindowMs: number,
-): {
-  status: SessionStatus;
-  createdAt: string | null;
-  idleEnteredAt: string | null;
-  dormant: boolean;
-} {
-  const first = statusRepresentativeCandidates(ws, idleDecayWindowMs)[0];
-  if (first?.status === "Error") {
-    return {
-      status: "Error",
-      createdAt: first.created_at,
-      idleEnteredAt: null,
-      dormant: false,
-    };
-  }
-  return {
-    status: first?.status ?? "Unknown",
-    createdAt: first?.created_at ?? null,
-    idleEnteredAt: first?.idle_entered_at ?? null,
-    dormant: first?.dormant ?? false,
-  };
 }
 
 function canStopSession(session: SessionResponse): boolean {
@@ -597,7 +572,7 @@ function TrashMenu({
 }: {
   trashedWorkspaces: Workspace[];
   readOnly?: boolean;
-  onOpen: (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
+  onOpen: (workspace: Workspace, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onRestore: (sessionIds: string[]) => void;
   onDelete: (workspaceId: string) => void;
   onEmptyTrash: () => void;
@@ -759,7 +734,7 @@ function TrashMenu({
                             type="button"
                             onClick={() => {
                               setOpen(false);
-                              onOpen(ws.id, { metaKey: false, ctrlKey: false, shiftKey: false });
+                              onOpen(ws, { metaKey: false, ctrlKey: false, shiftKey: false });
                             }}
                             data-testid="sidebar-trash-open"
                             className="inline-flex h-7 items-center rounded-md border border-surface-700/50 px-2.5 text-[12px] font-medium text-text-secondary hover:border-surface-600 hover:bg-surface-700/40 hover:text-text-primary cursor-pointer transition-colors"
@@ -1051,7 +1026,7 @@ export const SessionRow = memo(function SessionRow({
     createdAt,
     idleEnteredAt,
     dormant: sessionDormant,
-  } = bestSession(workspace, idleDecayWindowMs);
+  } = aggregateSessionDisplay(workspace.sessions, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
@@ -1079,13 +1054,7 @@ export const SessionRow = memo(function SessionRow({
   const runningSession = workspace.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   const singleSession = workspace.sessions.length === 1;
   const childSessions = useMemo(
-    () =>
-      singleSession
-        ? []
-        : [...workspace.sessions].sort(
-            (a, b) =>
-              b.created_at.localeCompare(a.created_at) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id),
-          ),
+    () => (singleSession ? [] : sessionsInDisplayOrder(workspace.sessions)),
     [singleSession, workspace.sessions],
   );
   const duplicateChildLabels = useMemo(() => {
@@ -1101,8 +1070,13 @@ export const SessionRow = memo(function SessionRow({
   const baseBranch = firstSession?.base_branch ?? null;
   const rowTagMode = useSessionRowTagMode();
   const rowTag = computeSessionRowTag(workspace, rowTagMode);
+  const hasMultipleWorkspaceRepos = (firstSession?.workspace_repos?.length ?? 0) > 1;
+  const visibleRowTag =
+    !singleSession && branchLabel && rowTag?.kind === "branch" && !hasMultipleWorkspaceRepos ? null : rowTag;
   const rowTagTitle =
-    rowTag?.kind === "branch" && baseBranch ? `${rowTag.title} (based on ${baseBranch})` : rowTag?.title;
+    visibleRowTag?.kind === "branch" && baseBranch
+      ? `${visibleRowTag.title} (based on ${baseBranch})`
+      : visibleRowTag?.title;
   const label = singleSession ? sessionTitle || branchLabel || "default" : branchLabel || sessionTitle || "default";
   // Workspace renders as favorited when any of its sessions are
   // favorited. Mirrors the TUI's within-tier pin: the star promotes the
@@ -1153,9 +1127,12 @@ export const SessionRow = memo(function SessionRow({
         ? "needs attention (error)"
         : "needs your attention";
   const sessionId = firstSession?.id;
-  const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
+  const navigationSession = singleSession
+    ? (firstSession ?? null)
+    : groupedParentNavigationSession(childSessions, activeSessionId);
+  const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
-  const isDeleting = sessionStatus === "Deleting";
+  const isDeleting = singleSession ? sessionStatus === "Deleting" : navigationSessionId === null;
   // Compact rail: keep status glyph + color dot + truncated title, drop the
   // prefix markers, trailing badges, and sub-rows that will not fit (#2288).
   const compact = useSidebarCompact();
@@ -1553,6 +1530,7 @@ export const SessionRow = memo(function SessionRow({
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
         data-testid="sidebar-session-row"
+        data-status={sessionStatus}
         title={needsAttention ? `${label} · ${attentionHint}` : label}
         draggable={false}
         onClick={(e) => {
@@ -1640,24 +1618,29 @@ export const SessionRow = memo(function SessionRow({
                 {label}
               </span>
               {!compact && !singleSession && (
-                <span className="inline-flex shrink-0 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim">
-                  {workspace.sessions.length} sessions
+                <span
+                  data-testid="sidebar-session-count"
+                  title={`${workspace.sessions.length} sessions`}
+                  aria-label={`${workspace.sessions.length} sessions`}
+                  className="inline-flex shrink-0 whitespace-nowrap rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium tabular-nums text-text-dim"
+                >
+                  {workspace.sessions.length}
                 </span>
               )}
               {/* Trailing badges hidden in the compact rail (#2288). */}
               {!compact && (
                 <>
-                  {rowTag && (
+                  {visibleRowTag && (
                     <span
                       data-testid="sidebar-session-row-tag"
                       title={rowTagTitle}
                       className={`inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium ${
-                        rowTag.kind === "branch"
+                        visibleRowTag.kind === "branch"
                           ? "border-brand-700/40 bg-brand-700/5 text-brand-300"
                           : "border-surface-700/40 bg-surface-800/40 text-text-dim"
                       }`}
                     >
-                      [{rowTag.content}]
+                      [{visibleRowTag.content}]
                     </span>
                   )}
                   {hasDraft && (
@@ -3778,13 +3761,14 @@ export function WorkspaceSidebar({
   // (today's behavior), modifier clicks build the selection instead. The row
   // has already guarded button / deleting / drag, and called preventDefault.
   const handleRowActivate = useCallback(
-    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+    (workspace: Workspace, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+      const workspaceId = workspace.id;
       // Read-only: ignore modifier gestures entirely and always navigate, so
       // no hidden selection state can build up.
       if (readOnly) {
         dispatchSelection({ type: "clear" });
         setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
-        onSelect(workspaceId);
+        onSelect(workspace);
         return;
       }
       const intent = classifyClick(e);
@@ -3792,7 +3776,7 @@ export function WorkspaceSidebar({
         case "navigate":
           dispatchSelection({ type: "navigate", id: workspaceId });
           setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
-          onSelect(workspaceId);
+          onSelect(workspace);
           break;
         case "toggle":
           dispatchSelection({ type: "toggle", id: workspaceId });
@@ -4126,7 +4110,7 @@ export function WorkspaceSidebar({
                                     isActive={v.workspace.id === displayedActiveId}
                                     activeSessionId={activeSessionId}
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                    onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                    onActivate={(e) => handleRowActivate(v.workspace, e)}
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
@@ -4236,7 +4220,7 @@ export function WorkspaceSidebar({
                                 isActive={v.workspace.id === displayedActiveId}
                                 activeSessionId={activeSessionId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                onActivate={(e) => handleRowActivate(v.workspace, e)}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4314,7 +4298,7 @@ export function WorkspaceSidebar({
                                 isActive={v.workspace.id === displayedActiveId}
                                 activeSessionId={activeSessionId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                onActivate={(e) => handleRowActivate(v.workspace, e)}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4401,7 +4385,7 @@ export function WorkspaceSidebar({
                       isActive={v.workspace.id === displayedActiveId}
                       activeSessionId={activeSessionId}
                       isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                      onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                      onActivate={(e) => handleRowActivate(v.workspace, e)}
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}

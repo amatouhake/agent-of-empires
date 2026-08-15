@@ -1278,8 +1278,12 @@
       "id": "sidebar.shared-worktree-session-navigation",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/sidebar-multi-session.spec.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/App.tsx"]
+      "specs": [
+        "tests/sidebar-multi-session.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/lib/__tests__/sessionDisplay.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/App.tsx", "web/src/lib/sessionDisplay.ts"]
     },
     {
       "id": "sidebar.ios-callout-suppression",

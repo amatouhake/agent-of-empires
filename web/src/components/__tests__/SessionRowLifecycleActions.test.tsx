@@ -113,17 +113,25 @@ afterEach(() => {
 });
 
 describe("grouped SessionRow lifecycle actions", () => {
-  it("stops the unique running sibling that supplies the grouped row state", () => {
-    const idle = session({ id: "idle-a", status: "Idle" });
+  it("stops the unique active sibling from the same class that supplies the grouped display state", () => {
     const running = session({ id: "running-b", status: "Running" });
-    const onStop = vi.fn();
+    const companions = [session({ id: "idle-a", status: "Idle" }), session({ id: "error-a", status: "Error" })];
 
-    renderRow(workspace([idle, running]), { onStop });
-    openMenu();
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-stop"));
-
-    expect(onStop).toHaveBeenCalledWith("running-b");
-    expect(onStop).not.toHaveBeenCalledWith("idle-a");
+    for (const companion of companions) {
+      for (const candidates of [
+        [companion, running],
+        [running, companion],
+      ]) {
+        const onStop = vi.fn();
+        renderRow(workspace(candidates), { onStop });
+        expect(screen.getByTestId("sidebar-session-row").getAttribute("data-status")).toBe("Running");
+        openMenu();
+        fireEvent.click(screen.getByTestId("sidebar-context-menu-stop"));
+        expect(onStop).toHaveBeenCalledWith("running-b");
+        expect(onStop).not.toHaveBeenCalledWith(companion.id);
+        cleanup();
+      }
+    }
   });
 
   it("keeps single-session lifecycle and workspace-level Delete and Archive scopes unchanged", () => {

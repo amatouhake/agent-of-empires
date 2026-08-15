@@ -162,18 +162,18 @@ describe("SessionRow chips", () => {
   it("renders grouped session children and dispatches the exact selected session", () => {
     const ws = workspace("w-shared-worktree", [
       session({
-        id: "sess-idle",
-        title: "Independent reviewer",
-        branch: "feature/shared",
-        status: "Idle",
-        created_at: "2025-01-02T00:00:00Z",
-      }),
-      session({
         id: "sess-running",
         title: "Creator integration",
         branch: "feature/shared",
         status: "Running",
         created_at: "2025-01-01T00:00:00Z",
+      }),
+      session({
+        id: "sess-idle",
+        title: "Independent reviewer",
+        branch: "feature/shared",
+        status: "Idle",
+        created_at: "2025-01-02T00:00:00Z",
       }),
     ]);
     ws.branch = "feature/shared";
@@ -181,15 +181,19 @@ describe("SessionRow chips", () => {
     const onOpen = (event: Event) => opened.push((event as CustomEvent).detail.sessionId);
     window.addEventListener(OPEN_SESSION_EVENT, onOpen);
     try {
-      render(
+      const { rerender } = render(
         <Wrap>
           <Row ws={ws} isActive activeSessionId="sess-idle" />
         </Wrap>,
       );
 
       const parent = screen.getByTestId("sidebar-session-row");
-      expect(parent.getAttribute("href")).toBe("/session/sess-running");
-      expect(parent.textContent).toContain("2 sessions");
+      expect(parent.getAttribute("href")).toBe("/session/sess-idle");
+      const count = screen.getByTestId("sidebar-session-count");
+      expect(count.textContent).toBe("2");
+      expect(count.getAttribute("title")).toBe("2 sessions");
+      expect(count.getAttribute("aria-label")).toBe("2 sessions");
+      expect(parent.textContent).not.toContain("2 sessions");
       const children = screen.getAllByTestId("sidebar-session-child");
       expect(children).toHaveLength(2);
       expect(children.map((child) => child.getAttribute("data-session-id"))).toEqual(["sess-idle", "sess-running"]);
@@ -199,8 +203,52 @@ describe("SessionRow chips", () => {
       expect(idleChild.getAttribute("aria-current")).toBe("page");
       fireEvent.click(idleChild);
       expect(opened).toEqual(["sess-idle"]);
+
+      rerender(
+        <Wrap>
+          <Row ws={ws} isActive activeSessionId="sess-running" />
+        </Wrap>,
+      );
+      expect(screen.getByTestId("sidebar-session-row").getAttribute("href")).toBe("/session/sess-running");
     } finally {
       window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    }
+  });
+
+  it("renders the aggregate grouped status and disables only an all-deleting parent", () => {
+    const cases = [
+      { statuses: ["Running", "Error"] as const, expected: "Running", disabled: false },
+      { statuses: ["Error", "Running"] as const, expected: "Running", disabled: false },
+      { statuses: ["Running", "Waiting"] as const, expected: "Waiting", disabled: false },
+      { statuses: ["Waiting", "Running"] as const, expected: "Waiting", disabled: false },
+      { statuses: ["Idle", "Error"] as const, expected: "Error", disabled: false },
+      { statuses: ["Idle", "Deleting"] as const, expected: "Idle", disabled: false },
+      { statuses: ["Deleting", "Deleting"] as const, expected: "Deleting", disabled: true },
+    ];
+
+    for (const { statuses, expected, disabled } of cases) {
+      const ws = workspace(
+        `w-${statuses.join("-")}`,
+        statuses.map((status, index) =>
+          session({
+            id: `${status}-${index}`,
+            title: `${status}-${index}`,
+            branch: "feature/shared",
+            status,
+            created_at: `2025-01-0${index + 1}T00:00:00Z`,
+          }),
+        ),
+      );
+      ws.branch = "feature/shared";
+      const { unmount } = render(
+        <Wrap>
+          <Row ws={ws} />
+        </Wrap>,
+      );
+      const parent = screen.getByTestId("sidebar-session-row");
+      expect(parent.getAttribute("data-status"), statuses.join(" + ")).toBe(expected);
+      expect(parent.getAttribute("aria-disabled") === "true", statuses.join(" + ")).toBe(disabled);
+      unmount();
     }
   });
 
@@ -289,12 +337,12 @@ describe("SessionRow chips", () => {
 });
 
 describe("SessionRow row tags", () => {
-  it("renders a compact branch tag and removes the hardcoded branch subtitle", () => {
+  it("keeps informative branch tags while suppressing a grouped single-repo duplicate", () => {
     const ws = {
       ...workspace("w-branch", [session({ branch: "feature/web-row-tag" })]),
       branch: "feature/web-row-tag",
     };
-    render(
+    const { rerender } = render(
       <Wrap rowTagMode="branch">
         <Row ws={ws} />
       </Wrap>,
@@ -302,6 +350,46 @@ describe("SessionRow row tags", () => {
 
     expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[web-row-tag]");
     expect(screen.queryByText("feature/web-row-tag")).toBeNull();
+
+    const grouped = {
+      ...workspace("w-grouped-branch", [
+        session({ id: "a", title: "Creator", branch: "feature/web-row-tag" }),
+        session({ id: "b", title: "Reviewer", branch: "feature/web-row-tag" }),
+      ]),
+      branch: "feature/web-row-tag",
+    };
+    rerender(
+      <Wrap rowTagMode="branch">
+        <Row ws={grouped} />
+      </Wrap>,
+    );
+    expect(screen.getByTestId("sidebar-session-row").textContent).toContain("feature/web-row-tag");
+    expect(screen.queryByTestId("sidebar-session-row-tag")).toBeNull();
+
+    const groupedMultiRepo = {
+      ...workspace("w-grouped-multi-repo", [
+        session({
+          id: "multi-a",
+          title: "Creator",
+          branch: "feature/web-row-tag",
+          base_branch: "main",
+          workspace_repos: [
+            { name: "api", source_path: "/repo/api", branch: "feature/web-row-tag" },
+            { name: "web", source_path: "/repo/web", branch: "feature/web-row-tag" },
+          ],
+        }),
+        session({ id: "multi-b", title: "Reviewer", branch: "feature/web-row-tag" }),
+      ]),
+      branch: "feature/web-row-tag",
+    };
+    rerender(
+      <Wrap rowTagMode="branch">
+        <Row ws={groupedMultiRepo} />
+      </Wrap>,
+    );
+    const multiRepoTag = screen.getByTestId("sidebar-session-row-tag");
+    expect(multiRepoTag.textContent).toBe("[web-row-ta+2]");
+    expect(multiRepoTag.getAttribute("title")).toBe("feature/web-row-tag across 2 repos (based on main)");
   });
 
   it("hides all session suffix metadata when row_tag is none", () => {
