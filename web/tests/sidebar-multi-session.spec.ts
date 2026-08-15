@@ -1,5 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
+import { openMobileSidebar } from "./helpers/sidebar";
 
 // Two sessions sharing the same `(project_path, branch=null)` collapsed
 // behind `workspace.sessions[0]` and only one rendered in the sidebar.
@@ -239,6 +240,48 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(branchRow).toHaveCount(1);
   });
 
+  test("grouped worktree exposes every sibling and opens the exact idle session", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-a",
+        title: "Creator integration",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Running",
+      },
+      {
+        id: "sess-b",
+        title: "Independent reviewer",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Idle",
+      },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+
+    const parent = page.getByTestId("sidebar-session-row");
+    await expect(parent).toHaveCount(1);
+    await expect(parent).toContainText("feature/shared-worktree");
+    await expect(parent).toContainText("2 sessions");
+    // Parent navigation keeps the existing running-session preference.
+    await expect(parent).toHaveAttribute("href", /\/session\/sess-a$/);
+
+    const children = page.getByTestId("sidebar-session-child");
+    await expect(children).toHaveCount(2);
+    await expect(page.getByTestId("sidebar-session-children")).toContainText("Creator integration");
+    await expect(page.getByTestId("sidebar-session-children")).toContainText("Independent reviewer");
+
+    const idleSibling = page.locator('[data-testid="sidebar-session-child"][data-session-id="sess-b"]');
+    await expect(idleSibling).toHaveAttribute("href", /\/session\/sess-b$/);
+    await idleSibling.click();
+
+    await expect(page).toHaveURL(/\/session\/sess-b$/);
+    await expect(idleSibling).toHaveAttribute("aria-current", "page");
+    await expect(parent).toHaveAttribute("href", /\/session\/sess-a$/);
+  });
+
   test("distinct branches render their own rows (regression guard)", async ({ page }) => {
     await mockApis(page, [
       {
@@ -415,5 +458,38 @@ test.describe("Sidebar multi-session (#956)", () => {
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
     await expect(menu.locator("[data-testid='sidebar-group-context-menu-rename']")).toBeVisible();
+  });
+});
+
+test.describe("Sidebar shared-worktree siblings on mobile", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test("tapping a child opens that exact session", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-a",
+        title: "Running creator with a deliberately long session title",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Running",
+      },
+      {
+        id: "sess-b",
+        title: "Idle reviewer with a deliberately long session title",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/shared-worktree",
+        status: "Idle",
+      },
+    ]);
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+    await openMobileSidebar(page);
+
+    const idleSibling = page.locator('[data-testid="sidebar-session-child"][data-session-id="sess-b"]');
+    await expect(idleSibling).toBeVisible();
+    await expect(idleSibling).toHaveCSS("min-height", "32px");
+    await idleSibling.tap();
+
+    await expect(page).toHaveURL(/\/session\/sess-b$/);
   });
 });

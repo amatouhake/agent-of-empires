@@ -328,6 +328,9 @@ interface Props {
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
+  /** Exact open session, used to highlight one child inside a grouped
+   *  explicit-worktree workspace. */
+  activeSessionId?: string | null;
   open: boolean;
   onToggle: () => void;
   onSelect: (workspaceId: string) => void;
@@ -866,6 +869,7 @@ function SortableSessionRow({
   rowKey?: string;
   workspace: Workspace;
   isActive: boolean;
+  activeSessionId?: string | null;
   isSelected: boolean;
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
@@ -990,6 +994,7 @@ function SortableRepoGroup({
 export const SessionRow = memo(function SessionRow({
   workspace,
   isActive,
+  activeSessionId,
   isSelected,
   onActivate,
   onDelete,
@@ -1008,6 +1013,7 @@ export const SessionRow = memo(function SessionRow({
 }: {
   workspace: Workspace;
   isActive: boolean;
+  activeSessionId?: string | null;
   // Whether this row is part of the sidebar multi-select. See #1724.
   isSelected: boolean;
   // Row click. The parent interprets the modifier keys (plain navigates,
@@ -1072,6 +1078,24 @@ export const SessionRow = memo(function SessionRow({
   const acpSession = workspace.sessions.find((s) => s.view === "structured");
   const runningSession = workspace.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   const singleSession = workspace.sessions.length === 1;
+  const childSessions = useMemo(
+    () =>
+      singleSession
+        ? []
+        : [...workspace.sessions].sort(
+            (a, b) =>
+              b.created_at.localeCompare(a.created_at) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id),
+          ),
+    [singleSession, workspace.sessions],
+  );
+  const duplicateChildLabels = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const session of childSessions) {
+      const childLabel = session.title.trim() || session.tool || "Session";
+      counts.set(childLabel, (counts.get(childLabel) ?? 0) + 1);
+    }
+    return new Set([...counts].filter(([, count]) => count > 1).map(([childLabel]) => childLabel));
+  }, [childSessions]);
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
   const baseBranch = firstSession?.base_branch ?? null;
@@ -1615,6 +1639,11 @@ export const SessionRow = memo(function SessionRow({
               <span className="truncate" title={label}>
                 {label}
               </span>
+              {!compact && !singleSession && (
+                <span className="inline-flex shrink-0 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim">
+                  {workspace.sessions.length} sessions
+                </span>
+              )}
               {/* Trailing badges hidden in the compact rail (#2288). */}
               {!compact && (
                 <>
@@ -1751,6 +1780,73 @@ export const SessionRow = memo(function SessionRow({
           </div>
         </div>
       </a>
+      {!singleSession && (
+        // Keep the grouped worktree as the action owner. Children only provide
+        // exact-session navigation, so destructive scope cannot change silently.
+        <div role="group" data-testid="sidebar-session-children" aria-label={`${label} sessions`}>
+          {childSessions.map((session) => {
+            const childLabel = session.title.trim() || session.tool || "Session";
+            const duplicateLabel = duplicateChildLabels.has(childLabel);
+            const childActive = session.id === activeSessionId;
+            const childDeleting = session.status === "Deleting";
+            const childTextClass = getStatusTextClass(session, idleDecayWindowMs);
+            const createdAt = new Date(session.created_at);
+            const createdLabel = Number.isNaN(createdAt.getTime())
+              ? session.created_at
+              : createdAt.toLocaleString([], {
+                  month: "short",
+                  day: "numeric",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                });
+            const secondaryLabel = `${session.tool}${createdLabel ? ` · ${createdLabel}` : ""}`;
+            return (
+              <a
+                key={session.id}
+                href={`/session/${encodeURIComponent(session.id)}`}
+                aria-current={childActive ? "page" : undefined}
+                aria-disabled={childDeleting || undefined}
+                tabIndex={childDeleting ? -1 : undefined}
+                data-testid="sidebar-session-child"
+                data-session-id={session.id}
+                title={`${childLabel} · ${session.status}${duplicateLabel ? ` · ${secondaryLabel}` : ""}`}
+                draggable={false}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (e.button !== 0 || e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
+                  if (childDeleting) {
+                    e.preventDefault();
+                    return;
+                  }
+                  e.preventDefault();
+                  requestOpenSession(session.id);
+                }}
+                className={`flex min-h-8 w-full items-center gap-2 border-l-2 py-1.5 text-left font-mono cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
+                  compact ? "pl-5 pr-1" : indented ? "pl-12 pr-3" : "pl-9 pr-3"
+                } ${
+                  childActive
+                    ? "border-brand-600 bg-surface-850 text-text-primary"
+                    : "border-transparent text-text-secondary hover:bg-surface-700/30"
+                } ${childDeleting ? "opacity-50 pointer-events-none" : ""}`}
+              >
+                <span className={`shrink-0 text-xs leading-none ${childTextClass}`} aria-label={session.status}>
+                  <StatusGlyph
+                    status={session.status}
+                    createdAt={session.created_at}
+                    idleEnteredAt={session.idle_entered_at ?? null}
+                    dormant={session.dormant}
+                  />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[12px] md:text-[13px]">{childLabel}</span>
+                  {duplicateLabel && <span className="block truncate text-[10px] text-text-dim">{secondaryLabel}</span>}
+                </span>
+              </a>
+            );
+          })}
+        </div>
+      )}
       {contextMenu &&
         createPortal(
           <div
@@ -3189,6 +3285,7 @@ export function WorkspaceSidebar({
   onReorderWorkspaces,
   onReorderGroups,
   activeId,
+  activeSessionId,
   open,
   onToggle,
   onSelect,
@@ -4027,6 +4124,7 @@ export function WorkspaceSidebar({
                                     rowKey={v.key}
                                     workspace={v.workspace}
                                     isActive={v.workspace.id === displayedActiveId}
+                                    activeSessionId={activeSessionId}
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                     onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                     onDelete={onDeleteSession}
@@ -4136,6 +4234,7 @@ export function WorkspaceSidebar({
                                 key={`${repo.id}::${groupPath}::${v.key}`}
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
+                                activeSessionId={activeSessionId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                 onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                 onDelete={onDeleteSession}
@@ -4213,6 +4312,7 @@ export function WorkspaceSidebar({
                                 key={`${org.id}::${repo.id}::${v.key}`}
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
+                                activeSessionId={activeSessionId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                 onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                 onDelete={onDeleteSession}
@@ -4299,6 +4399,7 @@ export function WorkspaceSidebar({
                       key={v.key}
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
+                      activeSessionId={activeSessionId}
                       isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                       onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                       onDelete={onDeleteSession}

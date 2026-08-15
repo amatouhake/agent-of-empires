@@ -1275,6 +1275,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.shared-worktree-session-navigation",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-multi-session.spec.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/App.tsx"]
+    },
+    {
       "id": "sidebar.ios-callout-suppression",
       "kind": "mocked-playwright",
       "risk": "medium",

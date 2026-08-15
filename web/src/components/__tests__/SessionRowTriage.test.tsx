@@ -107,11 +107,13 @@ function Row({
   readOnly,
   onCreateSession,
   isActive = false,
+  activeSessionId,
 }: {
   ws: Workspace;
   readOnly?: boolean;
   onCreateSession?: (repoPath: string) => void;
   isActive?: boolean;
+  activeSessionId?: string | null;
 }) {
   const workspaces = useMemo(() => [ws], [ws]);
   const triage = useSidebarTriage(workspaces);
@@ -119,6 +121,7 @@ function Row({
     <SessionRow
       workspace={ws}
       isActive={isActive}
+      activeSessionId={activeSessionId}
       isSelected={false}
       onActivate={() => {}}
       onCreateSession={onCreateSession}
@@ -156,6 +159,51 @@ afterEach(() => {
 });
 
 describe("SessionRow chips", () => {
+  it("renders grouped session children and dispatches the exact selected session", () => {
+    const ws = workspace("w-shared-worktree", [
+      session({
+        id: "sess-idle",
+        title: "Independent reviewer",
+        branch: "feature/shared",
+        status: "Idle",
+        created_at: "2025-01-02T00:00:00Z",
+      }),
+      session({
+        id: "sess-running",
+        title: "Creator integration",
+        branch: "feature/shared",
+        status: "Running",
+        created_at: "2025-01-01T00:00:00Z",
+      }),
+    ]);
+    ws.branch = "feature/shared";
+    const opened: string[] = [];
+    const onOpen = (event: Event) => opened.push((event as CustomEvent).detail.sessionId);
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    try {
+      render(
+        <Wrap>
+          <Row ws={ws} isActive activeSessionId="sess-idle" />
+        </Wrap>,
+      );
+
+      const parent = screen.getByTestId("sidebar-session-row");
+      expect(parent.getAttribute("href")).toBe("/session/sess-running");
+      expect(parent.textContent).toContain("2 sessions");
+      const children = screen.getAllByTestId("sidebar-session-child");
+      expect(children).toHaveLength(2);
+      expect(children.map((child) => child.getAttribute("data-session-id"))).toEqual(["sess-idle", "sess-running"]);
+
+      const idleChild = children[0]!;
+      expect(idleChild.getAttribute("href")).toBe("/session/sess-idle");
+      expect(idleChild.getAttribute("aria-current")).toBe("page");
+      fireEvent.click(idleChild);
+      expect(opened).toEqual(["sess-idle"]);
+    } finally {
+      window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    }
+  });
+
   it("renders the Pin glyph when any session is pinned", () => {
     const ws = workspace("w-pinned", [session({ pinned_at: "2026-01-01T00:00:00Z" })]);
     render(
