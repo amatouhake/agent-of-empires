@@ -357,8 +357,8 @@ interface Props {
   /** Purge every trashed workspace in one action (#3167), mirroring the TUI
    *  Empty Trash. Confirmation lives in the Trash panel; this just runs it. */
   onEmptyTrash?: () => void;
-  onStopSession?: (workspaceId: string) => void;
-  onStartSession?: (workspaceId: string) => void;
+  onStopSession?: (sessionId: string) => void;
+  onStartSession?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** When false (CityHall client mode), the Projects management section is
@@ -373,6 +373,13 @@ interface Props {
   onAxisChange: (axis: SidebarAxis) => void;
 }
 
+function statusRepresentativeCandidates(ws: Workspace, idleDecayWindowMs: number): SessionResponse[] {
+  const active = ws.sessions.filter((s) => isSessionActive(s, idleDecayWindowMs));
+  if (active.length > 0) return active;
+  const errors = ws.sessions.filter((s) => s.status === "Error");
+  return errors.length > 0 ? errors : ws.sessions;
+}
+
 function bestSession(
   ws: Workspace,
   idleDecayWindowMs: number,
@@ -382,29 +389,29 @@ function bestSession(
   idleEnteredAt: string | null;
   dormant: boolean;
 } {
-  const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-  if (running)
-    return {
-      status: running.status,
-      createdAt: running.created_at,
-      idleEnteredAt: running.idle_entered_at ?? null,
-      dormant: running.dormant,
-    };
-  const error = ws.sessions.find((s) => s.status === "Error");
-  if (error)
+  const first = statusRepresentativeCandidates(ws, idleDecayWindowMs)[0];
+  if (first?.status === "Error") {
     return {
       status: "Error",
-      createdAt: error.created_at,
+      createdAt: first.created_at,
       idleEnteredAt: null,
       dormant: false,
     };
-  const first = ws.sessions[0];
+  }
   return {
     status: first?.status ?? "Unknown",
     createdAt: first?.created_at ?? null,
     idleEnteredAt: first?.idle_entered_at ?? null,
     dormant: first?.dormant ?? false,
   };
+}
+
+/** The session whose lifecycle state a grouped row can act on without guessing.
+ *  The row's status prefers active sessions, then errors, then its ordinary
+ *  fallback. Only one candidate in that winning class is actionable. */
+function lifecycleActionSession(ws: Workspace, idleDecayWindowMs: number): SessionResponse | null {
+  const preferred = statusRepresentativeCandidates(ws, idleDecayWindowMs);
+  return preferred.length === 1 ? preferred[0]! : null;
 }
 
 /** Derive which of the three context-menu presets best describes a
@@ -848,8 +855,8 @@ function SortableSessionRow({
   isSelected: boolean;
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
-  onStop?: (workspaceId: string) => void;
-  onStart?: (workspaceId: string) => void;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
@@ -994,8 +1001,8 @@ export const SessionRow = memo(function SessionRow({
   // than navigating directly. See #1724.
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
-  onStop?: (workspaceId: string) => void;
-  onStart?: (workspaceId: string) => void;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
   // Switch this row's session between structured view and terminal. The parent
   // (App) opens the confirm dialog and calls acp enable/disable. See #2252.
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
@@ -1034,6 +1041,7 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
+  const lifecycleSession = lifecycleActionSession(workspace, idleDecayWindowMs);
   // Repo path used to prefill a "New Session" launched from this row, matching
   // the per-project "+" button (handleCreateSession keys off this same path).
   const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
@@ -1459,18 +1467,18 @@ export const SessionRow = memo(function SessionRow({
 
   const handleStop = () => {
     setContextMenu(null);
-    onStop?.(workspace.id);
+    if (lifecycleSession) onStop?.(lifecycleSession.id);
   };
-  // Mirror the TUI's `x` guard: a session that is already stopped or
-  // mid-lifecycle has nothing to stop, so hide the action for those.
-  const canStop = !["Stopped", "Deleting", "Creating"].includes(sessionStatus);
+  // Mirror the TUI's `x` guard, but only when the grouped row identifies one
+  // lifecycle session. Multiple equal-priority siblings need explicit selection.
+  const canStop = !!lifecycleSession && !["Stopped", "Deleting", "Creating"].includes(lifecycleSession.status);
 
   const handleStart = () => {
     setContextMenu(null);
-    onStart?.(workspace.id);
+    if (lifecycleSession) onStart?.(lifecycleSession.id);
   };
-  // Start is the inverse of Stop: only offered for a stopped session.
-  const canStart = sessionStatus === "Stopped";
+  // A grouped row cannot choose among multiple stopped siblings by array order.
+  const canStart = lifecycleSession?.status === "Stopped";
 
   if (renaming) {
     return (
