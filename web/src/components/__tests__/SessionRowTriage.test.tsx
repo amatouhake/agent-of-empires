@@ -104,11 +104,13 @@ function Wrap({
 // `null` while the workspace has no row to render.
 function Row({
   ws,
+  sessionId,
   readOnly,
   onCreateSession,
   isActive = false,
 }: {
   ws: Workspace;
+  sessionId?: string;
   readOnly?: boolean;
   onCreateSession?: (repoPath: string) => void;
   isActive?: boolean;
@@ -118,6 +120,7 @@ function Row({
   return (
     <SessionRow
       workspace={ws}
+      sessionId={sessionId}
       isActive={isActive}
       isSelected={false}
       onActivate={() => {}}
@@ -415,6 +418,18 @@ describe("SessionRow context menu", () => {
 
     fireEvent.contextMenu(screen.getAllByTestId("sidebar-session-row")[1]!);
     expect(screen.getByTestId("sidebar-context-menu-switch-view")).not.toBeNull();
+  });
+
+  it("does not fall back to a different member for a stale exact target", () => {
+    const ws = workspace("w-stale", [session({ id: "current-session" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} sessionId="stale-session" />
+      </Wrap>,
+    );
+
+    expect(screen.getByTestId("sidebar-session-aggregate-row")).not.toBeNull();
+    expect(screen.queryByTestId("sidebar-session-row")).toBeNull();
   });
 
   it("offers Unpin plus Archive and Snooze when pinned", () => {

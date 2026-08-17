@@ -2073,8 +2073,20 @@ const SessionActionRow = memo(function SessionActionRow({
  * is rebuilt through the exact-target constructor before it receives any
  * Session action surface.
  */
-const AggregateSessionRow = memo(function AggregateSessionRow(props: SessionRowProps) {
-  const { workspace, activeSessionId, onActivate, onActivateSession, indented } = props;
+type AggregateSessionRowProps = SessionRowProps & {
+  renderMembers?: boolean;
+};
+
+const AggregateSessionRow = memo(function AggregateSessionRow(props: AggregateSessionRowProps) {
+  const {
+    workspace,
+    activeSessionId,
+    onActivate,
+    onActivateSession,
+    indented,
+    renderMembers = true,
+    ...rowProps
+  } = props;
   return (
     <div data-testid="sidebar-session-aggregate-row" data-session-count={workspace.sessions.length}>
       <div
@@ -2090,21 +2102,23 @@ const AggregateSessionRow = memo(function AggregateSessionRow(props: SessionRowP
           {workspace.sessions.length} sessions
         </span>
       </div>
-      <div data-testid="sidebar-session-members">
-        {workspace.sessions.map((session) => {
-          const memberWorkspace: Workspace = { ...workspace, sessions: [session] };
-          const memberProps: SessionRowProps = {
-            ...props,
-            workspace: memberWorkspace,
-            sessionId: session.id,
-            isActive: activeSessionId === session.id,
-            isSelected: false,
-            onActivate: (event) => (onActivateSession ? onActivateSession(session.id, event) : onActivate(event)),
-            indented: true,
-          };
-          return <SessionRow key={session.id} {...memberProps} />;
-        })}
-      </div>
+      {renderMembers && (
+        <div data-testid="sidebar-session-members">
+          {workspace.sessions.map((session) => {
+            const memberWorkspace: Workspace = { ...workspace, sessions: [session] };
+            const memberProps: SessionRowProps = {
+              ...rowProps,
+              workspace: memberWorkspace,
+              sessionId: session.id,
+              isActive: activeSessionId === session.id,
+              isSelected: false,
+              onActivate: (event) => (onActivateSession ? onActivateSession(session.id, event) : onActivate(event)),
+              indented: true,
+            };
+            return <SessionRow key={session.id} {...memberProps} />;
+          })}
+        </div>
+      )}
     </div>
   );
 });
@@ -2113,8 +2127,8 @@ const AggregateSessionRow = memo(function AggregateSessionRow(props: SessionRowP
 export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const row = buildSessionProjectionRow(props.workspace, props.sessionId);
   const target = buildSessionActionTarget(row);
-  if (!target || row.kind !== "session") {
-    return <AggregateSessionRow {...props} />;
+  if (row.kind === "aggregate" || !target) {
+    return <AggregateSessionRow {...props} renderMembers={props.sessionId === undefined} />;
   }
 
   const exactWorkspace: Workspace = { ...props.workspace, sessions: [row.session] };
