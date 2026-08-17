@@ -4756,6 +4756,21 @@ fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody) -> bool {
     body.scratch && create_body_uses_worktree(body)
 }
 
+/// Validate the current filesystem target before a project launch reaches the
+/// session builder. A saved Project is only a launch hint, so a stale or
+/// replaced path must fail closed without creating a Session.
+fn validate_project_launch_target(path: &std::path::Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("Project launch target is empty".to_string());
+    }
+    let metadata = std::fs::metadata(path)
+        .map_err(|_| "Project launch target is missing or inaccessible".to_string())?;
+    if !metadata.is_dir() {
+        return Err("Project launch target is not a directory".to_string());
+    }
+    Ok(())
+}
+
 /// Resolve the one-shot fork seed for a `fork_from` create request. A
 /// structured request (`structured == true`) forks through ACP `session/fork`
 /// against the parent's `acp_session_id`; a terminal request resumes the
@@ -5326,6 +5341,19 @@ pub async fn create_session(
             })),
         )
             .into_response();
+    }
+
+    if !body.scratch {
+        if let Err(message) = validate_project_launch_target(std::path::Path::new(&body.path)) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "project_target_invalid",
+                    "message": message,
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Validate user inputs for shell injection. For scratch sessions the
@@ -7837,6 +7865,23 @@ mod tests {
     }
 
     #[test]
+    fn project_launch_target_validation_fails_closed_for_stale_or_invalid_paths() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("not-a-directory");
+        let missing = project.path().join("missing");
+        std::fs::write(&file, "content").unwrap();
+
+        let cases = [(project.path(), true), (&file, false), (&missing, false)];
+        for (path, valid) in cases {
+            assert_eq!(
+                validate_project_launch_target(path).is_ok(),
+                valid,
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn fork_from_builds_terminal_seed_for_claude() {
         // A non-structured (terminal) fork resolves through the shared
         // `terminal_fork_seed` helper; a claude parent id yields a Terminal
@@ -9206,6 +9251,9 @@ mod tests {
         let validation = create_source
             .find("validate_session_tool_identity")
             .unwrap();
+        let target_validation = create_source
+            .find("validate_project_launch_target")
+            .unwrap();
         let unwrap_or_else = create_source.find("body.profile.unwrap_or_else").unwrap();
         let spawn_blocking = create_source.find("tokio::task::spawn_blocking").unwrap();
         let builder = create_source.find("builder::build_instance").unwrap();
@@ -9215,6 +9263,8 @@ mod tests {
         assert!(validation < spawn_blocking);
         assert!(validation < builder);
         assert!(validation < storage);
+        assert!(target_validation < builder);
+        assert!(target_validation < storage);
         assert!(create_source.contains("body.profile.as_deref().unwrap_or(&state.profile)"));
         assert!(create_source.contains("std::path::Path::new(&body.path)"));
         assert!(!create_source[validation..spawn_blocking].contains("command_override"));
