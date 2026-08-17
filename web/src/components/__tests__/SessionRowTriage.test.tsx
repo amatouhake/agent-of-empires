@@ -407,7 +407,7 @@ describe("SessionRow context menu", () => {
     );
 
     const aggregate = screen.getByTestId("sidebar-session-aggregate-row");
-    expect(aggregate).toHaveAttribute("data-session-count", "2");
+    expect(aggregate.getAttribute("data-session-count")).toBe("2");
     expect(screen.getAllByTestId("sidebar-session-row")).toHaveLength(2);
 
     fireEvent.contextMenu(aggregate);

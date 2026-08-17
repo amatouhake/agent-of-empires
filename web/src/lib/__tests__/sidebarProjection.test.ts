@@ -2,11 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  SIDEBAR_PROJECTION_KEY,
-  loadSidebarProjection,
-  saveSidebarProjection,
-} from "../sidebarProjection";
+import { SIDEBAR_PROJECTION_KEY, loadSidebarProjection, saveSidebarProjection } from "../sidebarProjection";
 
 describe("sidebar projection persistence", () => {
   afterEach(() => {

@@ -11,4 +11,3 @@ export function useSidebarProjection(): readonly [SidebarProjection, (projection
 
   return [projection, update] as const;
 }
-

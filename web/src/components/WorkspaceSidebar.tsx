@@ -1018,12 +1018,7 @@ const SessionActionRow = memo(function SessionActionRow({
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const sessionColorsEnabled = useSessionColorsEnabled();
-  const {
-    status: sessionStatus,
-    createdAt,
-    idleEnteredAt,
-    dormant: sessionDormant,
-  } = bestSession(targetSession);
+  const { status: sessionStatus, createdAt, idleEnteredAt, dormant: sessionDormant } = bestSession(targetSession);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
@@ -2087,7 +2082,9 @@ const AggregateSessionRow = memo(function AggregateSessionRow(props: SessionRowP
         className={`flex items-center gap-2 py-2 text-text-secondary ${indented ? "pl-6 pr-3" : "px-3"}`}
       >
         <Layers className="h-3.5 w-3.5 shrink-0 text-text-muted" aria-hidden="true" />
-        <span className="truncate text-[13px] md:text-[14px]">{workspace.displayName || workspace.branch || "Sessions"}</span>
+        <span className="truncate text-[13px] md:text-[14px]">
+          {workspace.displayName || workspace.branch || "Sessions"}
+        </span>
         <span className="ml-auto shrink-0 text-[11px] font-mono text-text-muted">
           {workspace.sessions.length} sessions
         </span>
@@ -2101,8 +2098,7 @@ const AggregateSessionRow = memo(function AggregateSessionRow(props: SessionRowP
             sessionId: session.id,
             isActive: activeSessionId === session.id,
             isSelected: false,
-            onActivate: (event) =>
-              onActivateSession ? onActivateSession(session.id, event) : onActivate(event),
+            onActivate: (event) => (onActivateSession ? onActivateSession(session.id, event) : onActivate(event)),
             indented: true,
           };
           return <SessionRow key={session.id} {...memberProps} />;
@@ -2999,9 +2995,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
                 Unpin project
               </button>
             )}
-            {(canPin || canUnpin) && canAppearance && (
-              <div className="border-t border-surface-700/20 my-1" />
-            )}
+            {(canPin || canUnpin) && canAppearance && <div className="border-t border-surface-700/20 my-1" />}
             {canAppearance && (
               <>
                 <button
@@ -3957,7 +3951,9 @@ export function WorkspaceSidebar({
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                     activeSessionId={activeSessionId}
                                     onActivate={(e) => handleRowActivate(v.workspace.id, e)}
-                                    onActivateSession={(sessionId, e) => handleRowActivate(v.workspace.id, e, sessionId)}
+                                    onActivateSession={(sessionId, e) =>
+                                      handleRowActivate(v.workspace.id, e, sessionId)
+                                    }
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}

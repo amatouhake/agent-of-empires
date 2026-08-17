@@ -465,12 +465,7 @@ function AppContent({
   const allSidebarGroup = useMemo(() => allSessionsSidebarGroup(repoSidebarGroups), [repoSidebarGroups]);
   const groupedProjection = sidebarProjection === "groups" || sidebarAxis === "group";
   const sidebarGroups = useMemo(
-    () =>
-      sidebarProjection === "all"
-        ? [allSidebarGroup]
-        : groupedProjection
-          ? sessionGroups
-          : repoSidebarGroups,
+    () => (sidebarProjection === "all" ? [allSidebarGroup] : groupedProjection ? sessionGroups : repoSidebarGroups),
     [allSidebarGroup, groupedProjection, repoSidebarGroups, sessionGroups, sidebarProjection],
   );
   const toggleSidebarGroup = groupedProjection ? toggleGroupCollapsed : toggleRepoCollapsed;
@@ -1098,22 +1093,21 @@ function AppContent({
 
   const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
   const deletingSessionTarget = deletingSessionId
-    ? (workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === deletingSessionId) ?? null)
+    ? (workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === deletingSessionId) ??
+      null)
     : null;
-  const deletingSessions = deletingSessionTarget
-    ? [deletingSessionTarget]
-    : (deletingWorkspace?.sessions ?? []);
+  const deletingSessions = deletingSessionTarget ? [deletingSessionTarget] : (deletingWorkspace?.sessions ?? []);
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingSessionTarget;
   const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
-  const deletingCleanupDefaults = deletingSessions.length > 0
-    ? {
-        delete_to_trash: deletingDefaultToTrash,
-        ...workspaceCleanupDefaults(deletingSessions),
-      }
-    : null;
-  const deletingBranchName =
-    deletingSessions.find((session) => session.branch)?.branch ?? null;
+  const deletingCleanupDefaults =
+    deletingSessions.length > 0
+      ? {
+          delete_to_trash: deletingDefaultToTrash,
+          ...workspaceCleanupDefaults(deletingSessions),
+        }
+      : null;
+  const deletingBranchName = deletingSessions.find((session) => session.branch)?.branch ?? null;
 
   const handleDeleteSession = useCallback((sessionId: string) => {
     setDeletingWorkspaceId(null);
@@ -1268,7 +1262,8 @@ function AppContent({
   );
 
   const stoppingSession = stoppingSessionId
-    ? (workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === stoppingSessionId) ?? null)
+    ? (workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === stoppingSessionId) ??
+      null)
     : null;
 
   const handleStopSession = useCallback((sessionId: string) => {
@@ -1317,7 +1312,9 @@ function AppContent({
 
   const handleStartSession = useCallback(
     async (sessionId: string) => {
-      const session = workspaces.flatMap((workspace) => workspace.sessions).find((candidate) => candidate.id === sessionId);
+      const session = workspaces
+        .flatMap((workspace) => workspace.sessions)
+        .find((candidate) => candidate.id === sessionId);
       if (!session) return;
 
       // Optimistic Starting; the status poller reconciles to the real state.

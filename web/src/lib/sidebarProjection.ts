@@ -13,4 +13,3 @@ export function loadSidebarProjection(): SidebarProjection {
 export function saveSidebarProjection(projection: SidebarProjection): void {
   safeSetItem(SIDEBAR_PROJECTION_KEY, projection);
 }
-
