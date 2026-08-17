@@ -11,6 +11,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  allSessionsSidebarGroup,
   archivableWorkspaces,
   buildNestedSidebarGroups,
   buildOrgGroups,
@@ -224,6 +225,19 @@ describe("repoGroupToSidebarGroup", () => {
     const sg = repoGroupToSidebarGroup(repoGroup({ id: MULTI_REPO_GROUP_ID, repoPath: MULTI_REPO_GROUP_ID }));
     expect(sg.capabilities.create).toBe("generic");
     expect(sg.capabilities.appearance).toBe(true);
+  });
+
+  it("builds All from full project rows without changing Session identity", () => {
+    const shared = workspace("w-shared", [session({ id: "session-a" }), session({ id: "session-b" })]);
+    const first = repoGroupToSidebarGroup(repoGroup({ workspaces: [shared] }));
+    const duplicate = repoGroupToSidebarGroup(repoGroup({ id: "/repo-b", repoPath: "/repo-b", workspaces: [shared] }));
+
+    const all = allSessionsSidebarGroup([first, duplicate]);
+
+    expect(all.workspaces).toHaveLength(1);
+    expect(all.workspaces[0]!.workspace.id).toBe("w-shared");
+    expect(all.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["session-a", "session-b"]);
+    expect(all.capabilities).toEqual({ appearance: false, reorder: false, create: "generic" });
   });
 });
 

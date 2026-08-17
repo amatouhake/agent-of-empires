@@ -2461,6 +2461,40 @@ export interface DeleteSessionOptions {
   keep_scratch?: boolean;
 }
 
+export interface DeleteSessionResult {
+  ok: boolean;
+  deleted: boolean;
+  error?: string;
+  messages?: string[];
+}
+
+/** Permanently delete one exact Session. This endpoint is used by an exact
+ * member row; whole-workspace deletion remains a separate aggregate action. */
+export async function deleteSession(id: string, options: DeleteSessionOptions = {}): Promise<DeleteSessionResult> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(options),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      status?: string;
+      message?: string;
+      messages?: string[];
+    };
+    if (!res.ok) {
+      return { ok: false, deleted: false, error: data.message || `Server error (${res.status})` };
+    }
+    return {
+      ok: true,
+      deleted: data.status === "deleted",
+      messages: data.messages,
+    };
+  } catch {
+    return { ok: false, deleted: false, error: "Could not reach the server" };
+  }
+}
+
 export interface WorkspaceDeleteFailure {
   id: string;
   error: string;

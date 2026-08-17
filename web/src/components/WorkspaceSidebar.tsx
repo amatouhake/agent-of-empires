@@ -60,8 +60,8 @@ import { CSS } from "@dnd-kit/utilities";
 import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace } from "../lib/types";
 import { ProjectsSection } from "./ProjectsSection";
 import type { SidebarAxis } from "../lib/sidebarAxis";
+import type { SidebarProjection } from "../lib/sidebarProjection";
 import {
-  archivableWorkspaces,
   nestedSidebarGroupShouldRender,
   orgNestedGroupShouldRender,
   sidebarGroupHasLiveWorkspace,
@@ -71,6 +71,7 @@ import {
   type SidebarGroup,
   type SidebarWorkspaceView,
 } from "../lib/sidebarGroups";
+import { buildSessionActionTarget, buildSessionProjectionRow } from "../lib/sessionProjection";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
 import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
@@ -328,9 +329,11 @@ interface Props {
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
+  activeSessionId?: string | null;
   open: boolean;
   onToggle: () => void;
   onSelect: (workspaceId: string) => void;
+  onSelectSession?: (sessionId: string) => void;
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
@@ -349,7 +352,8 @@ interface Props {
   /** Remove a project: delete every registration for its path. */
   onRemoveProject: (group: RepoGroup) => void;
   onSettings: () => void;
-  onDeleteSession?: (workspaceId: string) => void;
+  onDeleteSession?: (sessionId: string) => void;
+  onDeleteWorkspace?: (workspaceId: string) => void;
   /** Restore a trashed workspace from the Trash section: receives every
    *  session id in the workspace, since a workspace only lands in Trash when
    *  all of its sessions are trashed (#2489). */
@@ -357,8 +361,8 @@ interface Props {
   /** Purge every trashed workspace in one action (#3167), mirroring the TUI
    *  Empty Trash. Confirmation lives in the Trash panel; this just runs it. */
   onEmptyTrash?: () => void;
-  onStopSession?: (workspaceId: string) => void;
-  onStartSession?: (workspaceId: string) => void;
+  onStopSession?: (sessionId: string) => void;
+  onStartSession?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** When false (CityHall client mode), the Projects management section is
@@ -369,41 +373,23 @@ interface Props {
   onSortModeChange: (mode: SidebarSortMode) => void;
   pluginSortRef: { pluginId: string; entryId: string } | null;
   onPluginSortChange: (ref: { pluginId: string; entryId: string }) => void;
+  projection?: SidebarProjection;
+  onProjectionChange?: (projection: SidebarProjection) => void;
   axis: SidebarAxis;
   onAxisChange: (axis: SidebarAxis) => void;
 }
 
-function bestSession(
-  ws: Workspace,
-  idleDecayWindowMs: number,
-): {
+function bestSession(session: SessionResponse): {
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt: string | null;
   dormant: boolean;
 } {
-  const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-  if (running)
-    return {
-      status: running.status,
-      createdAt: running.created_at,
-      idleEnteredAt: running.idle_entered_at ?? null,
-      dormant: running.dormant,
-    };
-  const error = ws.sessions.find((s) => s.status === "Error");
-  if (error)
-    return {
-      status: "Error",
-      createdAt: error.created_at,
-      idleEnteredAt: null,
-      dormant: false,
-    };
-  const first = ws.sessions[0];
   return {
-    status: first?.status ?? "Unknown",
-    createdAt: first?.created_at ?? null,
-    idleEnteredAt: first?.idle_entered_at ?? null,
-    dormant: first?.dormant ?? false,
+    status: session.status,
+    createdAt: session.created_at,
+    idleEnteredAt: session.idle_entered_at ?? null,
+    dormant: session.dormant,
   };
 }
 
@@ -846,10 +832,12 @@ function SortableSessionRow({
   workspace: Workspace;
   isActive: boolean;
   isSelected: boolean;
+  activeSessionId?: string | null;
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
-  onDelete?: (workspaceId: string) => void;
-  onStop?: (workspaceId: string) => void;
-  onStart?: (workspaceId: string) => void;
+  onActivateSession?: (sessionId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
+  onDelete?: (sessionId: string) => void;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
@@ -966,36 +954,22 @@ function SortableRepoGroup({
   );
 }
 
-export const SessionRow = memo(function SessionRow({
-  workspace,
-  isActive,
-  isSelected,
-  onActivate,
-  onDelete,
-  onStop,
-  onStart,
-  onSwitchView,
-  onCreateSession,
-  readOnly,
-  indented,
-  optimistic,
-  onPinToggle,
-  onArchiveToggle,
-  onSnooze,
-  onUnreadToggle,
-  bulkApi,
-}: {
+export type SessionRowProps = {
   workspace: Workspace;
+  /** Omit for a single-session workspace; set for an exact member row. */
+  sessionId?: string;
   isActive: boolean;
   // Whether this row is part of the sidebar multi-select. See #1724.
   isSelected: boolean;
+  activeSessionId?: string | null;
   // Row click. The parent interprets the modifier keys (plain navigates,
   // Cmd/Ctrl toggles, Shift ranges), so the row forwards the event up rather
   // than navigating directly. See #1724.
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
-  onDelete?: (workspaceId: string) => void;
-  onStop?: (workspaceId: string) => void;
-  onStart?: (workspaceId: string) => void;
+  onActivateSession?: (sessionId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
+  onDelete?: (sessionId: string) => void;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
   // Switch this row's session between structured view and terminal. The parent
   // (App) opens the confirm dialog and calls acp enable/disable. See #2252.
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
@@ -1015,7 +989,32 @@ export const SessionRow = memo(function SessionRow({
   onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
   // Stable bridge for bulk triage from the right-click menu. See #2312.
   bulkApi: RowBulkApi;
-}) {
+};
+
+type SessionActionRowProps = SessionRowProps & {
+  targetSession: SessionResponse;
+};
+
+const SessionActionRow = memo(function SessionActionRow({
+  workspace,
+  isActive,
+  isSelected,
+  onActivate,
+  onDelete,
+  onStop,
+  onStart,
+  onSwitchView,
+  onCreateSession,
+  readOnly,
+  indented,
+  optimistic,
+  onPinToggle,
+  onArchiveToggle,
+  onSnooze,
+  onUnreadToggle,
+  bulkApi,
+  targetSession,
+}: SessionActionRowProps) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const sessionColorsEnabled = useSessionColorsEnabled();
@@ -1024,7 +1023,7 @@ export const SessionRow = memo(function SessionRow({
     createdAt,
     idleEnteredAt,
     dormant: sessionDormant,
-  } = bestSession(workspace, idleDecayWindowMs);
+  } = bestSession(targetSession);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
@@ -1033,42 +1032,37 @@ export const SessionRow = memo(function SessionRow({
     },
     idleDecayWindowMs,
   );
-  const firstSession = workspace.sessions[0];
+  const exactSession = targetSession;
   // Repo path used to prefill a "New Session" launched from this row, matching
   // the per-project "+" button (handleCreateSession keys off this same path).
-  const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
-  // The structured view session backing this row, if any. Drives the "Switch
-  // agent" context-menu item, which only makes sense for an ACP structured view
-  // session (tmux rows have no agent to hand off). Multi-session rows are
-  // rare; pick the first structured view session in the workspace.
-  const acpSession = workspace.sessions.find((s) => s.view === "structured");
-  const runningSession = workspace.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-  const singleSession = workspace.sessions.length === 1;
-  const sessionTitle = firstSession?.title.trim() ?? "";
+  const newSessionRepoPath = exactSession.main_repo_path || exactSession.project_path || null;
+  // The exact structured Session backing this row, if any. Drives the
+  // "Switch agent" context-menu item, which only makes sense for an ACP
+  // structured view session. A presentation aggregate never reaches this
+  // component.
+  const acpSession = targetSession.view === "structured" ? targetSession : null;
+  const runningSession = isSessionActive(targetSession, idleDecayWindowMs) ? targetSession : null;
+  const sessionTitle = exactSession.title.trim();
   const branchLabel = workspace.branch ?? null;
-  const baseBranch = firstSession?.base_branch ?? null;
+  const baseBranch = exactSession.base_branch ?? null;
   const rowTagMode = useSessionRowTagMode();
   const rowTag = computeSessionRowTag(workspace, rowTagMode);
   const rowTagTitle =
     rowTag?.kind === "branch" && baseBranch ? `${rowTag.title} (based on ${baseBranch})` : rowTag?.title;
-  const label = singleSession ? sessionTitle || branchLabel || "default" : branchLabel || sessionTitle || "default";
-  // Workspace renders as favorited when any of its sessions are
-  // favorited. Mirrors the TUI's within-tier pin: the star promotes the
-  // row visually so the user can find their starred work fast. Toggled
-  // via TUI `f`/`F` or `aoe session favorite|unfavorite`.
-  const isFavorited = workspace.sessions.some((s) => s.favorited);
-  // Per-session color label (#2383): the first session in the workspace that
-  // carries a color wins, mirroring how `snoozedUntil` picks the first match.
-  const sessionColor = workspace.sessions.map((s) => s.color).find((c) => c != null) ?? null;
+  const label = sessionTitle || branchLabel || "default";
+  // The favorite marker belongs to this exact Session. It mirrors the TUI's
+  // within-tier pin and is toggled via TUI `f`/`F` or the session command.
+  const isFavorited = exactSession.favorited;
+  // Per-session color label (#2383), owned by the exact member row.
+  const sessionColor = exactSession.color ?? null;
   const sessionColorDot = sessionColorDotClass(sessionColor);
-  // Web-only triage signals. `pinned` floats the workspace to the top
-  // of every sort mode; `archived` and `snoozedUntil` mark the row as
-  // sunk (the parent splits sunk workspaces into a separate collapsible
-  // section). Aggregators mirror the matching helpers in
-  // `lib/sidebarSort.ts` to keep render and sort in sync. See #1581.
-  const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
-  const isArchived = workspace.sessions.some((s) => s.archived_at != null);
-  const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
+  // Web-only triage signals for this exact Session. `pinned` floats the row
+  // to the top of every sort mode; `archived` and `snoozedUntil` mark it as
+  // sunk. The parent still decides which workspace rows belong in the
+  // collapsible sunk section. See #1581.
+  const isPinned = exactSession.pinned_at != null;
+  const isArchived = exactSession.archived_at != null;
+  const snoozedUntil = exactSession.snoozed_until ?? null;
   // Effective state for rendering: optimistic overrides win until the
   // sidebar's overlay reconciler drops them once the prop catches up.
   const effectivePinned = effectivePinnedOf(optimistic, isPinned);
@@ -1081,7 +1075,7 @@ export const SessionRow = memo(function SessionRow({
   // Sunk rows (archived/snoozed) suppress it too: the user dismissed the
   // row, so lighting it up as unread contradicts that. The `unread` flag
   // stays on disk, so unarchiving or unsnoozing restores the marker (#2571).
-  const serverUnread = workspace.sessions.some((s) => s.unread === true);
+  const serverUnread = exactSession.unread === true;
   const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
   const isUnread = unreadIndicatorEnabled && effectiveUnread && !isActive && !effectiveArchived && !effectiveSnoozed;
   // Like the TUI, the unread marker *replaces* the resting status glyph with a
@@ -1100,28 +1094,24 @@ export const SessionRow = memo(function SessionRow({
       : sessionStatus === "Error"
         ? "needs attention (error)"
         : "needs your attention";
-  const sessionId = firstSession?.id;
-  const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
-  const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
+  const sessionId = exactSession.id;
+  const sessionPath = `/session/${encodeURIComponent(exactSession.id)}`;
   const isDeleting = sessionStatus === "Deleting";
   // Compact rail: keep status glyph + color dot + truncated title, drop the
   // prefix markers, trailing badges, and sub-rows that will not fit (#2288).
   const compact = useSidebarCompact();
   const notifyPreset = detectNotifyPreset(
-    firstSession?.notify_on_waiting,
-    firstSession?.notify_on_idle,
-    firstSession?.notify_on_error,
+    exactSession.notify_on_waiting,
+    exactSession.notify_on_idle,
+    exactSession.notify_on_error,
   );
   // Surface an unsent acp-composer draft on this workspace's row.
-  // Drafts live in localStorage under `acp:draft:<session_id>`; we
-  // check every session id in the workspace so multi-session rows
-  // (rare today) still light up if any of them has pending text.
-  const sessionIds = useMemo(() => workspace.sessions.map((s) => s.id), [workspace.sessions]);
+  // Drafts live in localStorage under `acp:draft:<session_id>` and are keyed
+  // by this exact member row.
+  const sessionIds = useMemo(() => [exactSession.id], [exactSession.id]);
   const hasDraft = useHasDraftForSessions(sessionIds);
   // Queued structured view follow-up prompts waiting to fire when the current
-  // turn ends. Summed across the workspace's sessions, mirroring how
-  // `hasDraft` ORs the same set. Lets a user juggling sessions see at a
-  // glance which rows have prompts pending without opening the structured view.
+  // exact Session turn ends.
   const queuedCount = useQueuedCountForSessions(sessionIds);
   // Rate-limit park visibility parity with the structured view notice (#1715).
   // The server maps rate-limited stops to Idle, so the status glyph can't
@@ -1222,8 +1212,7 @@ export const SessionRow = memo(function SessionRow({
   // opens the capability-aware confirm dialog and calls acp enable/disable.
   const handleSwitchView = () => {
     setContextMenu(null);
-    if (!firstSession) return;
-    onSwitchView?.(firstSession.id, firstSession.view !== "structured");
+    onSwitchView?.(exactSession.id, exactSession.view !== "structured");
   };
 
   // Fork a structured session: create a new structured session that resumes the
@@ -1288,7 +1277,7 @@ export const SessionRow = memo(function SessionRow({
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
-  const sessionGroup = firstSession?.group_path ?? "";
+  const sessionGroup = exactSession.group_path;
   const [editingGroup, setEditingGroup] = useState(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressFired = useRef(false);
@@ -1410,7 +1399,7 @@ export const SessionRow = memo(function SessionRow({
   // session is tied (#1927) naming collapses into the rename action, so the
   // standalone workdir edit is hidden.
   const canEditWorkdir =
-    !!firstSession?.has_managed_worktree && !firstSession?.tie_workdir_to_name && !runningSession && !!sessionId;
+    exactSession.has_managed_worktree && !exactSession.tie_workdir_to_name && !runningSession && !!sessionId;
 
   const openWorkdirModal = () => {
     setContextMenu(null);
@@ -1428,11 +1417,11 @@ export const SessionRow = memo(function SessionRow({
   // the in-flight-turn probe and answers 409, which the modal surfaces, so a row
   // that is merely idle between turns stays attachable.
   const canAddProject =
-    !firstSession?.scratch &&
-    !firstSession?.archived_at &&
-    !firstSession?.trashed_at &&
-    firstSession?.status !== "Creating" &&
-    firstSession?.status !== "Deleting";
+    !exactSession.scratch &&
+    !exactSession.archived_at &&
+    !exactSession.trashed_at &&
+    exactSession.status !== "Creating" &&
+    exactSession.status !== "Deleting";
 
   const openAddProjectModal = () => {
     setContextMenu(null);
@@ -1454,12 +1443,12 @@ export const SessionRow = memo(function SessionRow({
 
   const handleDelete = () => {
     setContextMenu(null);
-    onDelete?.(workspace.id);
+    onDelete?.(exactSession.id);
   };
 
   const handleStop = () => {
     setContextMenu(null);
-    onStop?.(workspace.id);
+    onStop?.(exactSession.id);
   };
   // Mirror the TUI's `x` guard: a session that is already stopped or
   // mid-lifecycle has nothing to stop, so hide the action for those.
@@ -1467,7 +1456,7 @@ export const SessionRow = memo(function SessionRow({
 
   const handleStart = () => {
     setContextMenu(null);
-    onStart?.(workspace.id);
+    onStart?.(exactSession.id);
   };
   // Start is the inverse of Stop: only offered for a stopped session.
   const canStart = sessionStatus === "Stopped";
@@ -1646,7 +1635,7 @@ export const SessionRow = memo(function SessionRow({
                       <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
                     </span>
                   )}
-                  {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
+                  {exactSession.view === "structured" && exactSession.acp_worker_state === "resuming" && (
                     <span
                       title="Structured view worker is resuming"
                       aria-label="Resuming"
@@ -1656,7 +1645,7 @@ export const SessionRow = memo(function SessionRow({
                       Resuming
                     </span>
                   )}
-                  {firstSession?.smart_rename === "pending" && (
+                  {exactSession.smart_rename === "pending" && (
                     <span
                       title="Will auto-name this session from your first message"
                       aria-label="Will auto-name"
@@ -1666,7 +1655,7 @@ export const SessionRow = memo(function SessionRow({
                       <span className="hidden sm:inline">Auto-name</span>
                     </span>
                   )}
-                  {firstSession?.smart_rename === "running" && (
+                  {exactSession.smart_rename === "running" && (
                     <span
                       title="Generating a name from your first message"
                       aria-label="Naming"
@@ -1676,10 +1665,10 @@ export const SessionRow = memo(function SessionRow({
                       Naming…
                     </span>
                   )}
-                  {firstSession?.next_wakeup_at && (
-                    <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
+                  {exactSession.next_wakeup_at && (
+                    <WakeupCountdown wakeAt={exactSession.next_wakeup_at} reason={exactSession.next_wakeup_reason} />
                   )}
-                  {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
+                  {exactSession.monitor_active && <MonitorBadge description={exactSession.monitor_description} />}
                 </>
               )}
             </span>
@@ -1687,9 +1676,9 @@ export const SessionRow = memo(function SessionRow({
                 height/clutter that does not belong in the slim rail (#2288). */}
             {!compact && (
               <>
-                {firstSession && <PluginRowLine sessionId={firstSession.id} />}
-                {firstSession?.plan_summary &&
-                  firstSession.plan_summary.total > 0 &&
+                <PluginRowLine sessionId={exactSession.id} />
+                {exactSession.plan_summary &&
+                  exactSession.plan_summary.total > 0 &&
                   // Hide the completed-plan bar when the session is also
                   // sitting idle waiting for the next prompt: at that
                   // point the bar is a static "100% 5/5" line that adds
@@ -1698,15 +1687,15 @@ export const SessionRow = memo(function SessionRow({
                   // either emits a new plan (resetting completed) or
                   // stays on the old one but flips status back to Running.
                   !(
-                    firstSession.plan_summary.completed >= firstSession.plan_summary.total &&
-                    firstSession.status === "Idle"
-                  ) && <PlanProgressMini summary={firstSession.plan_summary} />}
-                {firstSession && (firstSession.workspace_repos?.length ?? 0) > 1 && (
+                    exactSession.plan_summary.completed >= exactSession.plan_summary.total &&
+                    exactSession.status === "Idle"
+                  ) && <PlanProgressMini summary={exactSession.plan_summary} />}
+                {exactSession.workspace_repos.length > 1 && (
                   <span
                     className="mt-0.5 flex flex-wrap gap-1 text-[10px] font-mono text-text-dim"
-                    title={firstSession.workspace_repos.map((r) => r.source_path).join("\n")}
+                    title={exactSession.workspace_repos.map((r) => r.source_path).join("\n")}
                   >
-                    {firstSession.workspace_repos.map((r) => (
+                    {exactSession.workspace_repos.map((r) => (
                       <span
                         key={r.source_path}
                         className="px-1 py-px bg-surface-800/50 border border-surface-700/40 rounded text-text-secondary"
@@ -1790,14 +1779,14 @@ export const SessionRow = memo(function SessionRow({
                     Edit group
                   </button>
                 )}
-                {!readOnly && firstSession && (firstSession.view === "structured" || firstSession.acp_capable) && (
+                {!readOnly && (exactSession.view === "structured" || exactSession.acp_capable) && (
                   <button
                     onClick={handleSwitchView}
                     data-testid="sidebar-context-menu-switch-view"
                     className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                   >
                     <SquareTerminal className="h-3.5 w-3.5 shrink-0" />
-                    {firstSession.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
+                    {exactSession.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
                   </button>
                 )}
                 {!readOnly && acpSession && (
@@ -2081,6 +2070,58 @@ export const SessionRow = memo(function SessionRow({
         )}
     </>
   );
+});
+
+/**
+ * Presentation-only parent for a workspace with more than one Session. It
+ * deliberately has no link, context menu, or mutation callback. Every child
+ * is rebuilt through the exact-target constructor before it receives any
+ * Session action surface.
+ */
+const AggregateSessionRow = memo(function AggregateSessionRow(props: SessionRowProps) {
+  const { workspace, activeSessionId, onActivate, onActivateSession, indented } = props;
+  return (
+    <div data-testid="sidebar-session-aggregate-row" data-session-count={workspace.sessions.length}>
+      <div
+        aria-label={`${workspace.displayName}, ${workspace.sessions.length} sessions`}
+        className={`flex items-center gap-2 py-2 text-text-secondary ${indented ? "pl-6 pr-3" : "px-3"}`}
+      >
+        <Layers className="h-3.5 w-3.5 shrink-0 text-text-muted" aria-hidden="true" />
+        <span className="truncate text-[13px] md:text-[14px]">{workspace.displayName || workspace.branch || "Sessions"}</span>
+        <span className="ml-auto shrink-0 text-[11px] font-mono text-text-muted">
+          {workspace.sessions.length} sessions
+        </span>
+      </div>
+      <div data-testid="sidebar-session-members">
+        {workspace.sessions.map((session) => {
+          const memberWorkspace: Workspace = { ...workspace, sessions: [session] };
+          const memberProps: SessionRowProps = {
+            ...props,
+            workspace: memberWorkspace,
+            sessionId: session.id,
+            isActive: activeSessionId === session.id,
+            isSelected: false,
+            onActivate: (event) =>
+              onActivateSession ? onActivateSession(session.id, event) : onActivate(event),
+            indented: true,
+          };
+          return <SessionRow key={session.id} {...memberProps} />;
+        })}
+      </div>
+    </div>
+  );
+});
+
+/** The only exported row entry point. Aggregate rows cannot reach actions. */
+export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
+  const row = buildSessionProjectionRow(props.workspace, props.sessionId);
+  const target = buildSessionActionTarget(row);
+  if (!target || row.kind !== "session") {
+    return <AggregateSessionRow {...props} />;
+  }
+
+  const exactWorkspace: Workspace = { ...props.workspace, sessions: [row.session] };
+  return <SessionActionRow {...props} workspace={exactWorkspace} targetSession={row.session} />;
 });
 
 /** Edit-workdir-name modal. Renamed the worktree directory and, when the
@@ -2645,7 +2686,6 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   onClick,
   onNewSession,
   onUpdateAppearance,
-  onArchiveAll,
   onPin,
   onUnpin,
   offline,
@@ -2656,9 +2696,6 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   onClick: () => void;
   onNewSession: () => void;
   onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
-  /** Archive every active session under this group. Omitted (read-only /
-   *  offline) hides the action; the parent owns the confirmation. */
-  onArchiveAll?: () => void;
   /** Register this repo in the pin registry so it persists with zero
    *  sessions. Repo axis only; omitted (read-only / offline) hides it. */
   onPin?: (repoPath: string) => void;
@@ -2672,17 +2709,11 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // only. The user-group axis has no per-group appearance in v1, so the
   // menu trigger and rename input are gated off rather than rendered inert.
   const canAppearance = group.capabilities.appearance;
-  // "Archive all in group" works on every axis (a project or a manual
-  // group), so it can light up the context menu even where appearance is
-  // off. Count only the still-active members so the label is honest and the
-  // action hides once everything is already archived.
-  const archivableCount = onArchiveAll ? archivableWorkspaces(group).length : 0;
-  const canArchiveAll = archivableCount > 0;
   // Pin/unpin is repo-axis only and needs a concrete repo path. Pin shows
   // when the repo is not yet registered; unpin when it is. See #2047.
   const canPin = !!onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
   const canUnpin = !!onUnpin && group.kind === "repo" && group.pinned;
-  const hasMenu = canAppearance || canArchiveAll || canPin || canUnpin;
+  const hasMenu = canAppearance || canPin || canUnpin;
   const headerTitle = group.groupPath ?? group.repoPath;
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -2968,22 +2999,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
                 Unpin project
               </button>
             )}
-            {(canPin || canUnpin) && (canArchiveAll || canAppearance) && (
+            {(canPin || canUnpin) && canAppearance && (
               <div className="border-t border-surface-700/20 my-1" />
             )}
-            {canArchiveAll && (
-              <button
-                onClick={() => {
-                  setContextMenu(null);
-                  onArchiveAll?.();
-                }}
-                data-testid="sidebar-group-context-menu-archive-all"
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
-              >
-                {`Archive all (${archivableCount})`}
-              </button>
-            )}
-            {canArchiveAll && canAppearance && <div className="border-t border-surface-700/20 my-1" />}
             {canAppearance && (
               <>
                 <button
@@ -3105,9 +3123,11 @@ export function WorkspaceSidebar({
   onReorderWorkspaces,
   onReorderGroups,
   activeId,
+  activeSessionId,
   open,
   onToggle,
   onSelect,
+  onSelectSession,
   onToggleGroup,
   onUpdateRepoAppearance,
   onNew,
@@ -3120,6 +3140,7 @@ export function WorkspaceSidebar({
   onRemoveProject,
   onSettings,
   onDeleteSession,
+  onDeleteWorkspace,
   onRestoreSession,
   onEmptyTrash,
   onStopSession,
@@ -3131,6 +3152,8 @@ export function WorkspaceSidebar({
   onSortModeChange,
   pluginSortRef,
   onPluginSortChange,
+  projection = "projects",
+  onProjectionChange,
   axis,
   onAxisChange,
 }: Props) {
@@ -3322,13 +3345,15 @@ export function WorkspaceSidebar({
 
   // Optimistic triage overlay + single-id PATCH wiring, lifted out of
   // SessionRow so single-row and (in #1724) bulk actions share one source of
-  // truth. Triage always targets the workspace's primary session.
+  // truth. Triage always targets the exact Session represented by the row.
+  // Aggregate workspaces are skipped by the target constructor.
   const triage = useSidebarTriage(allWorkspaces);
 
   const q = activeFilterQuery.trim().toLowerCase();
 
-  const isNested = axis === "repo+group";
-  const isOrgAxis = axis === "org";
+  const displayAxis = projection === "all" ? "repo" : projection === "groups" ? "group" : axis;
+  const isNested = projection !== "all" && displayAxis === "repo+group";
+  const isOrgAxis = projection !== "all" && displayAxis === "org";
 
   // A row survives the text query when there is none, or it matches the
   // workspace/group name; a plugin facet filter (#2401) is ANDed on top, so an
@@ -3384,20 +3409,6 @@ export function WorkspaceSidebar({
         }))
         .filter((og) => og.repos.length > 0)
     : orgGroups;
-
-  // Full (pre-filter) repo objects keyed by `${orgId}::${repoId}`, so
-  // "Archive all" on a filtered org repo can still act on every workspace,
-  // not just the filter-matching ones. Built once per render instead of a
-  // double `.find()` per rendered repo. Memoized: an unmemoized `new Map()`
-  // here broke the React Compiler's ability to preserve the manual
-  // `useMemo` below (`flatRenderedOrder`).
-  const fullOrgRepoById: Map<string, SidebarGroup> = useMemo(
-    () =>
-      isOrgAxis
-        ? new Map(orgGroups.flatMap((o) => o.repos.map((r): [string, SidebarGroup] => [`${o.org.id}::${r.id}`, r])))
-        : new Map(),
-    [isOrgAxis, orgGroups],
-  );
 
   // A filter query that matches only a saved project (no live session) still
   // populates the Projects section, so it must not trigger the "No matches"
@@ -3568,42 +3579,21 @@ export function WorkspaceSidebar({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [selection.selectedIds.size]);
 
-  // Archive every active session under a group at once. Archiving a whole
-  // project is a bigger hammer than a single row, so it confirms first
-  // (matching the TUI's `z`-over-a-project prompt). Reversible, so a plain
-  // confirm rather than a destructive warning; the bulk fan-out reuses the
-  // same per-session path as multi-select archive. The caller must pass the
-  // unfiltered group (see `fullGroup`/`fullSubgroup` below) so an active
-  // search filter doesn't shrink "archive all" to the visible matches.
-  const onArchiveGroup = useCallback(
-    (group: SidebarGroup) => {
-      const wss = archivableWorkspaces(group);
-      if (wss.length === 0) return;
-      const noun = wss.length === 1 ? "session" : "sessions";
-      if (!window.confirm(`Archive all ${wss.length} ${noun} in "${group.displayName}"?`)) return;
-      onBulkArchive(wss, true);
-    },
-    [onBulkArchive],
-  );
-
-  // Unfiltered flat-axis groups keyed by id, so the group header's
-  // "Archive all" count and action can resolve full project membership even
-  // while a search filter has sliced the rendered `workspaces`. The nested
-  // repo header already carries full membership (`filteredNested` copies
-  // `ng.repo` unchanged); only the flat header and nested subgroups need it.
-  const groupById = useMemo(() => new Map(groups.map((g) => [g.id, g])), [groups]);
-
   // Interpret a row click: plain click clears the selection and navigates
   // (today's behavior), modifier clicks build the selection instead. The row
   // has already guarded button / deleting / drag, and called preventDefault.
   const handleRowActivate = useCallback(
-    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }, sessionId?: string) => {
+      const select = () => {
+        if (sessionId && onSelectSession) onSelectSession(sessionId);
+        else onSelect(workspaceId);
+      };
       // Read-only: ignore modifier gestures entirely and always navigate, so
       // no hidden selection state can build up.
       if (readOnly) {
         dispatchSelection({ type: "clear" });
         setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
-        onSelect(workspaceId);
+        select();
         return;
       }
       const intent = classifyClick(e);
@@ -3611,7 +3601,7 @@ export function WorkspaceSidebar({
         case "navigate":
           dispatchSelection({ type: "navigate", id: workspaceId });
           setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
-          onSelect(workspaceId);
+          select();
           break;
         case "toggle":
           dispatchSelection({ type: "toggle", id: workspaceId });
@@ -3634,7 +3624,7 @@ export function WorkspaceSidebar({
           break;
       }
     },
-    [activeId, onSelect, flatRenderedOrder, readOnly],
+    [activeId, flatRenderedOrder, onSelect, onSelectSession, readOnly],
   );
 
   const toggleFilter = () => {
@@ -3696,26 +3686,52 @@ export function WorkspaceSidebar({
           rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
         } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
+        {!compact && (
+          <nav
+            aria-label="Session projections"
+            data-testid="sidebar-projection-nav"
+            className="flex items-center gap-1 px-3 pt-2 text-[11px] font-mono uppercase tracking-wide"
+          >
+            {(["all", "projects", "groups"] as const).map((item) => (
+              <button
+                key={item}
+                type="button"
+                data-testid={`sidebar-projection-${item}`}
+                aria-current={projection === item ? "page" : undefined}
+                onClick={() => onProjectionChange?.(item)}
+                className={`rounded px-2 py-1 cursor-pointer transition-colors ${
+                  projection === item
+                    ? "bg-brand-500/15 text-brand-400"
+                    : "text-text-muted hover:bg-surface-700/50 hover:text-text-secondary"
+                }`}
+              >
+                {item === "all" ? "All" : item === "projects" ? "Projects" : "Groups"}
+              </button>
+            ))}
+          </nav>
+        )}
         <div className={`${compact ? "px-1" : "px-3"} pt-3 pb-1 flex items-center`}>
           {!compact && (
             <>
               <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
-                {AXIS_HEADING[axis]}
+                {projection === "all" ? "All" : projection === "groups" ? "Groups" : AXIS_HEADING[axis]}
               </span>
-              <Tooltip text={AXIS_TOOLTIP[axis]}>
-                <button
-                  onClick={() => onAxisChange(NEXT_AXIS[axis])}
-                  aria-pressed={axis !== "repo"}
-                  aria-label={axis === "repo" ? AXIS_ARIA[axis] : `${AXIS_ARIA[axis]}, currently pressed`}
-                  data-testid="sidebar-axis-toggle"
-                  data-axis={axis}
-                  className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                    axis !== "repo" ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
-                  }`}
-                >
-                  <Layers className="h-3.5 w-3.5" />
-                </button>
-              </Tooltip>
+              {projection === "projects" && (
+                <Tooltip text={AXIS_TOOLTIP[axis]}>
+                  <button
+                    onClick={() => onAxisChange(NEXT_AXIS[axis])}
+                    aria-pressed={axis !== "repo"}
+                    aria-label={axis === "repo" ? AXIS_ARIA[axis] : `${AXIS_ARIA[axis]}, currently pressed`}
+                    data-testid="sidebar-axis-toggle"
+                    data-axis={axis}
+                    className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+                      axis !== "repo" ? "text-brand-500" : "text-text-dim hover:text-text-secondary"
+                    }`}
+                  >
+                    <Layers className="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+              )}
               <SidebarSortPicker
                 sortMode={sortMode}
                 onSortModeChange={onSortModeChange}
@@ -3901,18 +3917,13 @@ export function WorkspaceSidebar({
                   const renderGroupBody = (group: SidebarGroup, dragHandle?: DragHandleProps) => {
                     const showExpanded = hasFilter ? true : !group.collapsed;
                     const hasActiveChild = group.workspaces.some((v) => v.workspace.id === displayedActiveId);
-                    // Header archive count + action operate on the full group,
-                    // not the filter-sliced one, so "Archive all" never silently
-                    // skips hidden members. Rows below still render `group`.
-                    const fullGroup = groupById.get(group.id) ?? group;
                     return (
                       <>
                         <SidebarGroupHeader
-                          group={{ ...fullGroup, collapsed: !showExpanded }}
+                          group={{ ...group, collapsed: !showExpanded }}
                           hasActiveChild={!showExpanded && hasActiveChild}
                           onClick={() => !hasFilter && onToggleGroup(group.id)}
                           onUpdateAppearance={onUpdateRepoAppearance}
-                          onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullGroup)}
                           onPin={readOnly || offline ? undefined : onPinProject}
                           onUnpin={readOnly || offline ? undefined : onUnpinProject}
                           onNewSession={() =>
@@ -3944,7 +3955,9 @@ export function WorkspaceSidebar({
                                     workspace={v.workspace}
                                     isActive={v.workspace.id === displayedActiveId}
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                                    activeSessionId={activeSessionId}
                                     onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                    onActivateSession={(sessionId, e) => handleRowActivate(v.workspace.id, e, sessionId)}
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
@@ -4007,7 +4020,6 @@ export function WorkspaceSidebar({
                     hasActiveChild={!repoExpanded && repoHasActiveChild}
                     onClick={() => !hasFilter && onToggleGroup(repo.id)}
                     onUpdateAppearance={onUpdateRepoAppearance}
-                    onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(repo)}
                     onPin={readOnly || offline ? undefined : onPinProject}
                     onUnpin={readOnly || offline ? undefined : onUnpinProject}
                     onNewSession={() =>
@@ -4024,12 +4036,6 @@ export function WorkspaceSidebar({
                       // footer below, exactly like the flat axes, so
                       // each subgroup renders only its live tier.
                       const liveWorkspaces = sg.workspaces.filter((v) => !workspaceIsSunk(v.workspace));
-                      // Resolve the unfiltered subgroup so "Archive all"
-                      // covers the whole subgroup, not just filter matches.
-                      const fullSubgroup =
-                        nestedGroups
-                          .find((n) => n.repo.id === repo.id)
-                          ?.subgroups.find((s) => (s.groupPath ?? "") === groupPath) ?? sg;
                       return (
                         <div
                           key={`${repo.id}::${groupPath}`}
@@ -4038,11 +4044,10 @@ export function WorkspaceSidebar({
                           data-repo-id={repo.id}
                         >
                           <SidebarGroupHeader
-                            group={{ ...fullSubgroup, collapsed: !subExpanded }}
+                            group={{ ...sg, collapsed: !subExpanded }}
                             hasActiveChild={!subExpanded && subHasActiveChild}
                             onClick={() => !hasFilter && onToggleSubgroup(repo.id, groupPath)}
                             onUpdateAppearance={onUpdateRepoAppearance}
-                            onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullSubgroup)}
                             onNewSession={onNew}
                             offline={offline}
                           />
@@ -4053,7 +4058,9 @@ export function WorkspaceSidebar({
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                                activeSessionId={activeSessionId}
                                 onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                onActivateSession={(sessionId, e) => handleRowActivate(v.workspace.id, e, sessionId)}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4088,7 +4095,6 @@ export function WorkspaceSidebar({
                     hasActiveChild={!orgExpanded && orgHasActiveChild}
                     onClick={() => !hasFilter && onToggleOrg(org.id)}
                     onUpdateAppearance={onUpdateRepoAppearance}
-                    onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(org)}
                     onNewSession={onNew}
                     offline={offline}
                   />
@@ -4100,9 +4106,6 @@ export function WorkspaceSidebar({
                       // footer below, exactly like the other axes, so
                       // each repo renders only its live tier.
                       const liveWorkspaces = repo.workspaces.filter((v) => !workspaceIsSunk(v.workspace));
-                      // Resolve the unfiltered repo so "Archive all"
-                      // covers the whole repo, not just filter matches.
-                      const fullRepo = fullOrgRepoById.get(`${org.id}::${repo.id}`) ?? repo;
                       return (
                         <div
                           key={`${org.id}::${repo.id}`}
@@ -4111,14 +4114,13 @@ export function WorkspaceSidebar({
                           data-repo-id={repo.id}
                         >
                           <SidebarGroupHeader
-                            group={{ ...fullRepo, collapsed: !repoExpanded }}
+                            group={{ ...repo, collapsed: !repoExpanded }}
                             hasActiveChild={!repoExpanded && repoHasActiveChild}
                             onClick={() => !hasFilter && onToggleOrgRepo(org.id, repo.id)}
                             onUpdateAppearance={onUpdateRepoAppearance}
-                            onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullRepo)}
                             onNewSession={() =>
-                              fullRepo.capabilities.create === "repo" && fullRepo.repoPath
-                                ? onCreateSession(fullRepo.repoPath)
+                              repo.capabilities.create === "repo" && repo.repoPath
+                                ? onCreateSession(repo.repoPath)
                                 : onNew()
                             }
                             offline={offline}
@@ -4130,7 +4132,9 @@ export function WorkspaceSidebar({
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                                activeSessionId={activeSessionId}
                                 onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                onActivateSession={(sessionId, e) => handleRowActivate(v.workspace.id, e, sessionId)}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4216,7 +4220,9 @@ export function WorkspaceSidebar({
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
                       isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                      activeSessionId={activeSessionId}
                       onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                      onActivateSession={(sessionId, e) => handleRowActivate(v.workspace.id, e, sessionId)}
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
@@ -4289,7 +4295,7 @@ export function WorkspaceSidebar({
               readOnly={readOnly}
               onOpen={handleRowActivate}
               onRestore={(ids) => onRestoreSession?.(ids)}
-              onDelete={(id) => onDeleteSession?.(id)}
+              onDelete={(id) => onDeleteWorkspace?.(id)}
               onEmptyTrash={() => onEmptyTrash?.()}
             />
           )}

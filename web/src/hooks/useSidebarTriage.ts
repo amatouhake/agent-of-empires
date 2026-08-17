@@ -10,6 +10,7 @@ import {
   type OptimisticTriage,
 } from "../lib/sidebarOptimistic";
 import type { Workspace } from "../lib/types";
+import { buildSessionActionTarget, buildSessionProjectionRow } from "../lib/sessionProjection";
 
 /** Outcome of one triage mutation, used to build the bulk summary toast. */
 export interface TriageResult {
@@ -19,12 +20,17 @@ export interface TriageResult {
   skipped?: boolean;
 }
 
+function exactSessionId(ws: Workspace): string | null {
+  return buildSessionActionTarget(buildSessionProjectionRow(ws))?.sessionId ?? null;
+}
+
 /** Sidebar triage controller: owns the optimistic overlay (keyed by workspace
  *  id) and the single-id PATCH calls for pin / archive / snooze, for both
  *  single-row and bulk actions. Lifted out of `SessionRow` so a bulk action
  *  can drive many rows from one place rather than reaching into N independent
- *  row components. Triage always targets the workspace's primary session
- *  (`sessions[0]`), matching the prior row-level behavior. See #1724. */
+ *  row components. Triage only targets an exact Session row. Aggregate
+ *  workspace rows are presentation-only and return a skipped result. See
+ *  #1724. */
 export function useSidebarTriage(workspaces: readonly Workspace[]) {
   const [overlay, setOverlay] = useState<Map<string, OptimisticTriage>>(() => new Map());
   const [trackedWorkspaces, setTrackedWorkspaces] = useState(workspaces);
@@ -48,7 +54,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const pin = useCallback(
     async (ws: Workspace, pinned: boolean): Promise<TriageResult> => {
-      const sessionId = ws.sessions[0]?.id;
+      const sessionId = exactSessionId(ws);
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
       setOverride(ws.id, { pinned });
       const result = await setSessionPin(sessionId, pinned);
@@ -63,7 +69,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const archive = useCallback(
     async (ws: Workspace, archived: boolean): Promise<TriageResult> => {
-      const sessionId = ws.sessions[0]?.id;
+      const sessionId = exactSessionId(ws);
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
       setOverride(ws.id, { archived });
       const result = await setSessionArchive(sessionId, archived);
@@ -78,7 +84,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const snooze = useCallback(
     async (ws: Workspace, minutes: number | null): Promise<TriageResult> => {
-      const sessionId = ws.sessions[0]?.id;
+      const sessionId = exactSessionId(ws);
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
       const optimisticUntil = minutes == null ? null : makeOptimisticSnoozedUntil(minutes);
       setOverride(ws.id, { snoozedUntil: optimisticUntil });
@@ -94,7 +100,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const unread = useCallback(
     async (ws: Workspace, markUnread: boolean): Promise<TriageResult> => {
-      const sessionId = ws.sessions[0]?.id;
+      const sessionId = exactSessionId(ws);
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
       // "Mark as unread" flags it; "Mark as read" clears it.
       setOverride(ws.id, { unread: markUnread });

@@ -11,7 +11,7 @@ import {
 } from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
-import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
+import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
@@ -32,7 +32,10 @@ import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
-import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
+import { useSidebarProjection } from "./hooks/useSidebarProjection";
+import { allSessionsSidebarGroup, repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
+import type { SidebarProjection } from "./lib/sidebarProjection";
+import { buildSessionActionTarget, buildSessionProjectionRow } from "./lib/sessionProjection";
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
@@ -66,6 +69,7 @@ import {
   logout,
   stopSession,
   startSession,
+  deleteSession,
   acpEnable,
   acpDisable,
   fetchAbout,
@@ -91,7 +95,7 @@ import {
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
-import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
+import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
@@ -328,7 +332,6 @@ function AppContent({
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
@@ -390,6 +393,7 @@ function AppContent({
 
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
   const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
+  const [sidebarProjection, setSidebarProjection] = useSidebarProjection();
 
   // Active plugin sort (#2401): an ephemeral selection of a live `sort-key`
   // entry. Not persisted (plugin entries die with the daemon). The ref is only
@@ -457,11 +461,30 @@ function AppContent({
   // repo axis maps in via an adapter, the user-group axis is already in
   // that shape. Collapse routing follows the active axis so the two
   // axes keep independent collapse state. See #1234.
+  const repoSidebarGroups = useMemo(() => repoGroups.map(repoGroupToSidebarGroup), [repoGroups]);
+  const allSidebarGroup = useMemo(() => allSessionsSidebarGroup(repoSidebarGroups), [repoSidebarGroups]);
+  const groupedProjection = sidebarProjection === "groups" || sidebarAxis === "group";
   const sidebarGroups = useMemo(
-    () => (sidebarAxis === "group" ? sessionGroups : repoGroups.map(repoGroupToSidebarGroup)),
-    [sidebarAxis, sessionGroups, repoGroups],
+    () =>
+      sidebarProjection === "all"
+        ? [allSidebarGroup]
+        : groupedProjection
+          ? sessionGroups
+          : repoSidebarGroups,
+    [allSidebarGroup, groupedProjection, repoSidebarGroups, sessionGroups, sidebarProjection],
   );
-  const toggleSidebarGroup = sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
+  const toggleSidebarGroup = groupedProjection ? toggleGroupCollapsed : toggleRepoCollapsed;
+  const handleSidebarProjectionChange = useCallback(
+    (next: SidebarProjection) => {
+      setSidebarProjection(next);
+      if (next === "groups") {
+        setSidebarAxis("group");
+      } else if (next === "projects" && sidebarAxis === "group") {
+        setSidebarAxis("repo");
+      }
+    },
+    [setSidebarAxis, setSidebarProjection, sidebarAxis],
+  );
 
   // Drag-end handler for the sidebar. Optimistically applies the new
   // order locally so the row snaps into place, then persists to the
@@ -962,8 +985,8 @@ function AppContent({
   const handleSelectWorkspace = (workspaceId: string) => {
     const ws = workspaces.find((w) => w.id === workspaceId);
     if (ws) {
-      const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-      const picked = running ?? ws.sessions[0] ?? null;
+      const target = buildSessionActionTarget(buildSessionProjectionRow(ws));
+      const picked = target ? (ws.sessions.find((session) => session.id === target.sessionId) ?? null) : null;
       if (picked) {
         transitionKeyboardProxy(picked.id);
         navigate(`/session/${encodeURIComponent(picked.id)}`);
@@ -1005,7 +1028,8 @@ function AppContent({
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
-  const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -1073,24 +1097,56 @@ function AppContent({
   }, []);
 
   const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
-  const deletingSessions = deletingWorkspace?.sessions ?? [];
+  const deletingSessionTarget = deletingSessionId
+    ? (workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === deletingSessionId) ?? null)
+    : null;
+  const deletingSessions = deletingSessionTarget
+    ? [deletingSessionTarget]
+    : (deletingWorkspace?.sessions ?? []);
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
-  const deletingSession = deletingWorkspace?.sessions[0] ?? null;
+  const deletingSession = deletingSessionTarget;
   const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
-  const deletingCleanupDefaults = deletingSession
+  const deletingCleanupDefaults = deletingSessions.length > 0
     ? {
         delete_to_trash: deletingDefaultToTrash,
         ...workspaceCleanupDefaults(deletingSessions),
       }
     : null;
   const deletingBranchName =
-    deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
+    deletingSessions.find((session) => session.branch)?.branch ?? null;
 
-  const handleDeleteSession = useCallback((workspaceId: string) => {
+  const handleDeleteSession = useCallback((sessionId: string) => {
+    setDeletingWorkspaceId(null);
+    setDeletingSessionId(sessionId);
+  }, []);
+
+  const handleDeleteWorkspace = useCallback((workspaceId: string) => {
+    setDeletingSessionId(null);
     setDeletingWorkspaceId(workspaceId);
   }, []);
 
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
+    if (deletingSessionTarget && !deletingWorkspace) {
+      const id = deletingSessionTarget.id;
+      setDeletingSessionId(null);
+      setSessionStatus(id, "Deleting");
+      const result = await deleteSession(id, options);
+      if (!result.ok) {
+        setSessionStatus(id, "Error");
+        toastBus.handler?.error(result.error ?? "Failed to delete session");
+        return;
+      }
+      if (result.deleted) {
+        clearAcpCache(id);
+        clearDraft(id);
+        clearStoredComments(id);
+        if (activeSessionId === id) navigate("/");
+        toastBus.handler?.info?.(result.messages?.[0] ?? "Session deleted");
+      } else {
+        toastBus.handler?.info?.("Session deletion was kept");
+      }
+      return;
+    }
     if (!deletingWorkspace) return;
     const sessions = deletingWorkspace.sessions;
     // Close the dialog immediately; the loop, ordering, and toast logic live
@@ -1171,6 +1227,18 @@ function AppContent({
   // so a restore is faithful; only purge clears them. Trashes every session
   // in the workspace so a multi-session workspace sinks as a whole.
   const handleConfirmTrash = async () => {
+    if (deletingSessionTarget && !deletingWorkspace) {
+      const id = deletingSessionTarget.id;
+      setDeletingSessionId(null);
+      setSessionStatus(id, "Stopped");
+      if (activeSessionId === id) navigate("/");
+      await trashSessions([id], {
+        applySession,
+        onError: (failedId) => setSessionStatus(failedId, "Error"),
+        notify: toastBus.handler,
+      });
+      return;
+    }
     if (!deletingWorkspace) return;
     const ids = deletingWorkspace.sessions.map((s) => s.id);
     if (ids.length === 0) return;
@@ -1199,11 +1267,12 @@ function AppContent({
     [applySession],
   );
 
-  const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
-  const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
+  const stoppingSession = stoppingSessionId
+    ? (workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === stoppingSessionId) ?? null)
+    : null;
 
-  const handleStopSession = useCallback((workspaceId: string) => {
-    setStoppingWorkspaceId(workspaceId);
+  const handleStopSession = useCallback((sessionId: string) => {
+    setStoppingSessionId(sessionId);
   }, []);
 
   const handleConfirmStop = useCallback(async () => {
@@ -1212,7 +1281,7 @@ function AppContent({
 
     // Close the dialog and show "Stopped" immediately; the 2s status poller
     // reconciles the true state and corrects this if the request fails.
-    setStoppingWorkspaceId(null);
+    setStoppingSessionId(null);
     setSessionStatus(sessionId, "Stopped");
 
     const result = await stopSession(sessionId);
@@ -1247,9 +1316,8 @@ function AppContent({
   }, [switchViewTarget]);
 
   const handleStartSession = useCallback(
-    async (workspaceId: string) => {
-      const ws = workspaces.find((w) => w.id === workspaceId);
-      const session = ws?.sessions[0];
+    async (sessionId: string) => {
+      const session = workspaces.flatMap((workspace) => workspace.sessions).find((candidate) => candidate.id === sessionId);
       if (!session) return;
 
       // Optimistic Starting; the status poller reconciles to the real state.
@@ -1616,12 +1684,13 @@ function AppContent({
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
         onEscape: () => {
-          if (deletingWorkspaceId) {
+          if (deletingWorkspaceId || deletingSessionId) {
             setDeletingWorkspaceId(null);
+            setDeletingSessionId(null);
             return;
           }
-          if (stoppingWorkspaceId) {
-            setStoppingWorkspaceId(null);
+          if (stoppingSessionId) {
+            setStoppingSessionId(null);
             return;
           }
           if (showPalette) {
@@ -1650,7 +1719,8 @@ function AppContent({
         toggleRightDock,
         showPalette,
         deletingWorkspaceId,
-        stoppingWorkspaceId,
+        deletingSessionId,
+        stoppingSessionId,
         showSettings,
         handleCloseSettings,
         navigate,
@@ -2245,9 +2315,11 @@ function AppContent({
               onReorderWorkspaces={handleReorderWorkspaces}
               onReorderGroups={reorderRepoGroups}
               activeId={activeWorkspace?.id ?? null}
+              activeSessionId={activeSessionId}
               open={sidebarOpen}
               onToggle={() => setSidebarOpen(false)}
               onSelect={handleSelectWorkspace}
+              onSelectSession={handleSelectSession}
               onToggleGroup={toggleSidebarGroup}
               onUpdateRepoAppearance={updateRepoAppearance}
               onNew={() => {
@@ -2263,6 +2335,7 @@ function AppContent({
               onRemoveProject={handleRemoveProject}
               onSettings={handleOpenSettings}
               onDeleteSession={handleDeleteSession}
+              onDeleteWorkspace={handleDeleteWorkspace}
               onRestoreSession={handleRestoreSession}
               onEmptyTrash={handleEmptyTrash}
               onStopSession={handleStopSession}
@@ -2274,6 +2347,8 @@ function AppContent({
               onSortModeChange={selectSidebarSortMode}
               pluginSortRef={pluginSortRef}
               onPluginSortChange={setPluginSortRef}
+              projection={sidebarProjection}
+              onProjectionChange={handleSidebarProjectionChange}
               axis={sidebarAxis}
               onAxisChange={setSidebarAxis}
             />
@@ -2330,9 +2405,9 @@ function AppContent({
         {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
         {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
 
-        {deletingSession && deletingCleanupDefaults && (
+        {(deletingSession || deletingWorkspace) && deletingCleanupDefaults && (
           <DeleteSessionDialog
-            sessionTitle={deletingSession.title}
+            sessionTitle={deletingSession?.title ?? deletingWorkspace?.displayName ?? "Workspace"}
             branchName={deletingBranchName}
             hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
             isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
@@ -2346,7 +2421,10 @@ function AppContent({
             }))}
             onConfirm={handleConfirmDelete}
             onTrash={handleConfirmTrash}
-            onCancel={() => setDeletingWorkspaceId(null)}
+            onCancel={() => {
+              setDeletingWorkspaceId(null);
+              setDeletingSessionId(null);
+            }}
           />
         )}
 
@@ -2354,7 +2432,7 @@ function AppContent({
           <StopSessionDialog
             sessionTitle={stoppingSession.title}
             onConfirm={handleConfirmStop}
-            onCancel={() => setStoppingWorkspaceId(null)}
+            onCancel={() => setStoppingSessionId(null)}
           />
         )}
 

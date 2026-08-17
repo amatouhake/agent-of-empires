@@ -3440,6 +3440,17 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.projection-alignment",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/sessionProjection.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/lib/__tests__/sidebarProjection.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/sidebarProjection.ts"]
+    },
+    {
       "id": "triage.acp-banners",
       "kind": "vitest",
       "risk": "medium",

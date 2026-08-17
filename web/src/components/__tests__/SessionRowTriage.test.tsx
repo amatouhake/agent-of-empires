@@ -395,6 +395,28 @@ describe("SessionRow smart-rename chip", () => {
 });
 
 describe("SessionRow context menu", () => {
+  it("keeps aggregate rows actionless while exact members retain their menu", () => {
+    const ws = workspace("w-aggregate", [
+      session({ id: "sess-a", title: "Session A" }),
+      session({ id: "sess-b", title: "Session B", view: "structured", acp_capable: true }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    const aggregate = screen.getByTestId("sidebar-session-aggregate-row");
+    expect(aggregate).toHaveAttribute("data-session-count", "2");
+    expect(screen.getAllByTestId("sidebar-session-row")).toHaveLength(2);
+
+    fireEvent.contextMenu(aggregate);
+    expect(screen.queryByTestId("sidebar-context-menu")).toBeNull();
+
+    fireEvent.contextMenu(screen.getAllByTestId("sidebar-session-row")[1]!);
+    expect(screen.getByTestId("sidebar-context-menu-switch-view")).not.toBeNull();
+  });
+
   it("offers Unpin plus Archive and Snooze when pinned", () => {
     const ws = workspace("w-pinned", [session({ pinned_at: "2026-01-01T00:00:00Z" })]);
     render(

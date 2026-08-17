@@ -113,6 +113,36 @@ export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
   };
 }
 
+/** Build the flat All projection from the authoritative repo-axis rows. */
+export function allSessionsSidebarGroup(groups: SidebarGroup[]): SidebarGroup {
+  const seen = new Set<string>();
+  const workspaces: SidebarWorkspaceView[] = [];
+  for (const group of groups) {
+    for (const view of group.workspaces) {
+      if (seen.has(view.workspace.id)) continue;
+      seen.add(view.workspace.id);
+      workspaces.push({ key: `all::${view.workspace.id}`, workspace: view.workspace });
+    }
+  }
+
+  return {
+    id: "__all_sessions__",
+    kind: "sessionGroup",
+    displayName: "All sessions",
+    defaultDisplayName: "All sessions",
+    alias: null,
+    color: null,
+    remoteOwner: null,
+    workspaces,
+    status: workspaces.some((view) => view.workspace.status === "active") ? "active" : "idle",
+    collapsed: false,
+    capabilities: { appearance: false, reorder: false, create: "generic" },
+    registeredProjects: [],
+    pinned: false,
+    pinnedEmpty: false,
+  };
+}
+
 function normalizeGroupPath(path: string | null | undefined): string {
   const trimmed = (path ?? "").trim();
   if (trimmed === "") return "";

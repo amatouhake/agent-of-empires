@@ -214,10 +214,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page).toHaveURL(/\/session\/sess-b$/);
   });
 
-  test("collapsing still applies when sessions share a non-null branch (worktree)", async ({ page }) => {
-    // Two sessions on the same explicit worktree branch DO still collapse;
-    // the fix only targets the null-branch (no-worktree) case. This matches
-    // the issue's option #2.
+  test("shared worktree sessions render as an actionless aggregate with exact members", async ({ page }) => {
     await mockApis(page, [
       {
         id: "sess-a",
@@ -235,8 +232,41 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
-    const branchRow = page.getByRole("link", { name: /feature\/x/i });
-    await expect(branchRow).toHaveCount(1);
+    const aggregate = page.locator('[data-testid="sidebar-session-aggregate-row"]');
+    await expect(aggregate).toHaveAttribute("data-session-count", "2");
+    await expect(aggregate).not.toHaveAttribute("href");
+    await expect(page.getByRole("link", { name: /Ethiopians/i })).toBeVisible();
+    await expect(page.getByRole("link", { name: /Celts/i })).toBeVisible();
+
+    await aggregate.click({ button: "right" });
+    await expect(page.locator('[data-testid="sidebar-context-menu"]')).toHaveCount(0);
+  });
+
+  test("All, Projects, and Groups keep each member's canonical Session link", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-a",
+        title: "Ethiopians",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/x",
+      },
+      {
+        id: "sess-b",
+        title: "Celts",
+        project_path: "/tmp/agent-of-empires",
+        branch: "feature/x",
+      },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+
+    for (const projection of ["all", "projects", "groups"] as const) {
+      await page.getByTestId(`sidebar-projection-${projection}`).click();
+      await expect(page.getByTestId(`sidebar-projection-${projection}`)).toHaveAttribute("aria-current", "page");
+      await expect(page.getByRole("link", { name: /Ethiopians/i })).toHaveAttribute("href", /\/session\/sess-a$/);
+      await expect(page.getByRole("link", { name: /Celts/i })).toHaveAttribute("href", /\/session\/sess-b$/);
+    }
   });
 
   test("distinct branches render their own rows (regression guard)", async ({ page }) => {
@@ -346,7 +376,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(restoredHeader).toHaveAttribute("style", /color-mix/);
   });
 
-  test("project group context menu archives every active session", async ({ page }) => {
+  test("project aggregate context menu exposes no session archive action", async ({ page }) => {
     await mockApis(page, [
       {
         id: "sess-a",
@@ -362,22 +392,6 @@ test.describe("Sidebar multi-session (#956)", () => {
       },
     ]);
 
-    const archived: string[] = [];
-    await page.route("**/api/sessions/*/archive", async (r) => {
-      const url = new URL(r.request().url());
-      const id = url.pathname.split("/")[3];
-      const body = r.request().postDataJSON() as { archived: boolean };
-      if (body.archived) archived.push(id);
-      await r.fulfill({ json: { id, archived_at: new Date().toISOString() } });
-    });
-
-    // The "archive all in project" action confirms first; accept it.
-    let confirmText = "";
-    page.on("dialog", (dialog) => {
-      confirmText = dialog.message();
-      void dialog.accept();
-    });
-
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
@@ -387,12 +401,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
 
-    const archiveAll = menu.locator("[data-testid='sidebar-group-context-menu-archive-all']");
-    await expect(archiveAll).toHaveText("Archive all (2)");
-    await archiveAll.click();
-
-    await expect.poll(() => archived.slice().sort()).toEqual(["sess-a", "sess-b"]);
-    expect(confirmText).toContain("Archive all 2 sessions");
+    await expect(menu.locator("[data-testid='sidebar-group-context-menu-archive-all']")).toHaveCount(0);
   });
 
   test("project group appearance menu opens from keyboard", async ({ page }) => {
