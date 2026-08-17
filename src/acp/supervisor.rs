@@ -218,8 +218,8 @@ pub trait BroadcastSink: Send + Sync + 'static {
     /// Durable stream generation used to reject a reservation that crossed a
     /// structured-view projection reset. Non-persistent test sinks use the
     /// initial generation.
-    fn stream_generation(&self, _session_id: &str) -> u64 {
-        1
+    fn stream_generation(&self, _session_id: &str) -> Option<u64> {
+        Some(1)
     }
     /// Drop all stored events for a session. Used by the import path to clear
     /// any partial replay from a prior failed attempt before re-seeding, run
@@ -444,7 +444,7 @@ impl SeqMap {
 
     fn append<R, G, F>(&self, session_id: &str, generation: G, f: F) -> (u64, R)
     where
-        G: FnOnce() -> u64,
+        G: FnOnce() -> Option<u64>,
         F: FnOnce(u64) -> R,
     {
         let slot = self.slot(session_id);
@@ -455,10 +455,12 @@ impl SeqMap {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        let generation = generation();
-        if state.generation != generation {
-            state.generation = generation;
-            state.next_seq = 0;
+        let current_generation = generation();
+        if let Some(generation) = current_generation {
+            if state.generation != generation {
+                state.generation = generation;
+                state.next_seq = 0;
+            }
         }
         state.next_seq = state.next_seq.saturating_add(1);
         let seq = state.next_seq;
@@ -474,7 +476,7 @@ impl SeqMap {
         f: F,
     ) -> Option<R>
     where
-        G: FnOnce() -> u64,
+        G: FnOnce() -> Option<u64>,
         F: FnOnce(u64) -> R,
     {
         let slot = self.slot(session_id);
@@ -485,10 +487,12 @@ impl SeqMap {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        let generation = generation();
-        if state.generation != generation {
-            state.generation = generation;
-            state.next_seq = 0;
+        let current_generation = generation();
+        if let Some(generation) = current_generation {
+            if state.generation != generation {
+                state.generation = generation;
+                state.next_seq = 0;
+            }
         }
         if state.next_seq != expected_seq {
             return None;
@@ -499,7 +503,7 @@ impl SeqMap {
 
     fn reserve<G>(&self, session_id: &str, generation: G) -> SeqReservationGuard
     where
-        G: FnOnce() -> u64,
+        G: FnOnce() -> Option<u64>,
     {
         let slot = self.slot(session_id);
         let mut state = lock_recover(&slot.state);
@@ -509,20 +513,23 @@ impl SeqMap {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        let generation = generation();
-        if state.generation != generation {
-            state.generation = generation;
-            state.next_seq = 0;
+        let current_generation = generation();
+        if let Some(generation) = current_generation {
+            if state.generation != generation {
+                state.generation = generation;
+                state.next_seq = 0;
+            }
         }
         state.next_seq = state.next_seq.saturating_add(1);
         let seq = state.next_seq;
+        let reservation_generation = state.generation;
         state.reserved = true;
         drop(state);
         SeqReservationGuard {
             slot,
             session_id: session_id.to_string(),
             seq,
-            generation,
+            generation: reservation_generation,
             committed: false,
         }
     }
@@ -546,7 +553,7 @@ impl SeqMap {
 
     fn forget<G>(&self, session_id: &str, generation: G)
     where
-        G: FnOnce() -> u64,
+        G: FnOnce() -> Option<u64>,
     {
         let slot = self.slot(session_id);
         let mut state = lock_recover(&slot.state);
@@ -556,7 +563,9 @@ impl SeqMap {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        state.generation = generation();
+        if let Some(generation) = generation() {
+            state.generation = generation;
+        }
         state.next_seq = 0;
     }
 }
@@ -583,11 +592,11 @@ struct SeqReservationGuard {
 impl SeqReservationGuard {
     fn commit<R, G, F>(&mut self, current_generation: G, f: F) -> Result<R, SeqReservationError>
     where
-        G: FnOnce() -> u64,
+        G: FnOnce() -> Option<u64>,
         F: FnOnce(u64) -> R,
     {
         let mut state = lock_recover(&self.slot.state);
-        if current_generation() != self.generation {
+        if current_generation().is_some_and(|generation| generation != self.generation) {
             state.reserved = false;
             self.slot.changed.notify_all();
             self.committed = true;
@@ -2130,14 +2139,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         // spawn reservation is held, rather than in the REST handler, so a
         // duplicate import spawn that bails with AlreadyRunning can't wipe a
         // live worker's stored transcript. See #2276.
-        if seed_history_replay {
-            if !self.sink.clear_session_events(&session_id) {
-                warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    "import replay cleanup failed; continuing with existing transcript"
-                );
-            }
+        if seed_history_replay && !self.sink.clear_session_events(&session_id) {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "import replay cleanup failed; continuing with existing transcript"
+            );
         }
 
         let acp_session_id = AcpSessionId(session_id.clone());
@@ -3773,7 +3780,7 @@ async fn restart_decision(
 /// `AppendOwner`, which keeps this allocation and the sink handoff ordered.
 #[cfg(test)]
 fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
-    next_seqs.append(session_id, || 1, |_| ()).0
+    next_seqs.append(session_id, || Some(1), |_| ()).0
 }
 
 /// Take a `std::sync::Mutex` guard, recovering the inner data if
@@ -3842,11 +3849,18 @@ impl BroadcastSink for ChannelSink {
         }
     }
 
-    fn stream_generation(&self, session_id: &str) -> u64 {
-        self.event_store
-            .stream_state(session_id)
-            .map(|state| state.stream_generation)
-            .unwrap_or(1)
+    fn stream_generation(&self, session_id: &str) -> Option<u64> {
+        match self.event_store.stream_state(session_id) {
+            Ok(state) => Some(state.stream_generation),
+            Err(error) => {
+                warn!(
+                    target: "acp.event_store",
+                    session = %session_id,
+                    "stream-generation read unavailable; preserving in-process append floor: {error}"
+                );
+                None
+            }
+        }
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
@@ -4255,14 +4269,18 @@ mod tests {
     #[test]
     fn seq_reservation_abandonment_releases_without_writer_queue_capacity() {
         let seqs = Arc::new(SeqMap::new());
-        let reservation = seqs.reserve("s-reservation", || 1);
+        let reservation = seqs.reserve("s-reservation", || Some(1));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let seqs_for_thread = Arc::clone(&seqs);
         let append = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             result_tx
-                .send(seqs_for_thread.append("s-reservation", || 1, |_| ()).0)
+                .send(
+                    seqs_for_thread
+                        .append("s-reservation", || Some(1), |_| ())
+                        .0,
+                )
                 .unwrap();
         });
         started_rx.recv().unwrap();
@@ -4271,23 +4289,23 @@ mod tests {
         append.join().unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _reservation = seqs.reserve("s-panic", || 1);
+            let _reservation = seqs.reserve("s-panic", || Some(1));
             panic!("abandon reservation");
         }));
         assert!(result.is_err());
-        assert_eq!(seqs.append("s-panic", || 1, |_| ()).0, 2);
+        assert_eq!(seqs.append("s-panic", || Some(1), |_| ()).0, 2);
     }
 
     #[test]
     fn stale_seq_reservation_cannot_commit_after_generation_change() {
         let seqs = SeqMap::new();
-        let mut reservation = seqs.reserve("s-stale", || 1);
-        let committed = reservation.commit(|| 2, |_| true);
+        let mut reservation = seqs.reserve("s-stale", || Some(1));
+        let committed = reservation.commit(|| Some(2), |_| true);
         assert!(matches!(
             committed,
             Err(SeqReservationError::StaleGeneration { .. })
         ));
-        assert_eq!(seqs.append("s-stale", || 2, |_| ()).0, 1);
+        assert_eq!(seqs.append("s-stale", || Some(2), |_| ()).0, 1);
     }
 
     #[tokio::test]

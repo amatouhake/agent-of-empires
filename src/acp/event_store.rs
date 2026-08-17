@@ -1054,22 +1054,14 @@ impl EventStore {
     /// Read the current durable stream generation for a session. This is used
     /// by the append owner to reject a stale reservation after an external
     /// reset or an old-binary whole-topic delete.
-    pub fn stream_state(&self, session_id: &str) -> Option<events::TopicState> {
-        if let Err(e) = self.authority.check_path_identity() {
-            warn!(target: "acp.event_store", "stream-state authority check failed: {e}");
-            return None;
-        }
+    pub fn stream_state(&self, session_id: &str) -> Result<events::TopicState> {
+        self.authority.check_path_identity()?;
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        match events::topic_state(&conn, &self.schema, session_id) {
-            Ok(state) => Some(state),
-            Err(e) => {
-                warn!(target: "acp.event_store", session = %session_id, "read stream state failed: {e}");
-                None
-            }
-        }
+        events::topic_state(&conn, &self.schema, session_id)
+            .with_context(|| format!("read stream state for {session_id}"))
     }
 
     /// Latest terminal-lifecycle event for `session_id`, used by the
@@ -1325,10 +1317,10 @@ impl EventStore {
                 Event::UserPromptSent { text, .. } if first_prompt.is_none() => {
                     first_prompt = Some(text);
                 }
-                Event::AgentMessageChunk { text } if first_prompt.is_some() => {
-                    if agent.len() < max_agent_bytes {
-                        agent.push_str(&text);
-                    }
+                Event::AgentMessageChunk { text }
+                    if first_prompt.is_some() && agent.len() < max_agent_bytes =>
+                {
+                    agent.push_str(&text);
                 }
                 // The first turn ends at the first `Stopped` after the prompt,
                 // whatever the reason. Breaking only on `prompt_complete` would

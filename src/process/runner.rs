@@ -1738,12 +1738,13 @@ async fn handle_control_connection(
                 shared.emit_control(frame).await;
             }
             ControlBody::Prompt { request } => {
-                if shared.agent_prompt(&agent_stdin, request).await.is_none() {
-                    warn!(
+                match shared.agent_prompt(&agent_stdin, request).await {
+                    Some(_) => {}
+                    None => warn!(
                         target: "acp.runner",
                         session = %session_id,
                         "prompt write to agent failed; likely exited"
-                    );
+                    ),
                 }
             }
             ControlBody::Cancel => {

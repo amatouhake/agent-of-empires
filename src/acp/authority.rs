@@ -38,6 +38,7 @@ pub fn acquire_bootstrap_lease(db_path: &Path) -> Result<BootstrapLease> {
     ));
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -83,6 +84,7 @@ impl DbAuthority {
         let logical_path = bootstrap_lease.logical_path().to_path_buf();
         let opened_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&logical_path)
@@ -99,6 +101,7 @@ impl DbAuthority {
         ));
         let identity_lease = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&identity_lock_path)
