@@ -2132,7 +2132,21 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   }
 
   const exactWorkspace: Workspace = { ...props.workspace, sessions: [row.session] };
-  return <SessionActionRow {...props} workspace={exactWorkspace} targetSession={row.session} />;
+  const onActivateExactSession = (event: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+    if (props.onActivateSession) {
+      props.onActivateSession(row.session.id, event);
+    } else {
+      props.onActivate(event);
+    }
+  };
+  return (
+    <SessionActionRow
+      {...props}
+      onActivate={onActivateExactSession}
+      workspace={exactWorkspace}
+      targetSession={row.session}
+    />
+  );
 });
 
 /** Edit-workdir-name modal. Renamed the worktree directory and, when the

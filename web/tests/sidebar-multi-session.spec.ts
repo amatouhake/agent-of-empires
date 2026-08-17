@@ -10,6 +10,7 @@ interface MockSession {
   id: string;
   title: string;
   project_path: string;
+  group_path?: string;
   branch: string | null;
   status?: string;
 }
@@ -64,7 +65,7 @@ async function mockApis(
           id: s.id,
           title: s.title,
           project_path: s.project_path,
-          group_path: s.project_path,
+          group_path: s.group_path ?? s.project_path,
           tool: "claude",
           status: s.status ?? "Idle",
           yolo_mode: false,
@@ -267,6 +268,49 @@ test.describe("Sidebar multi-session (#956)", () => {
       await expect(page.getByRole("link", { name: /Ethiopians/i })).toHaveAttribute("href", /\/session\/sess-a$/);
       await expect(page.getByRole("link", { name: /Celts/i })).toHaveAttribute("href", /\/session\/sess-b$/);
     }
+  });
+
+  test("Groups single-session slices activate their exact Session while aggregates stay inert", async ({ page }) => {
+    await mockApis(page, [
+      {
+        id: "sess-group-a",
+        title: "Group A session",
+        project_path: "/tmp/shared-worktree",
+        group_path: "group-a",
+        branch: "feature/shared",
+      },
+      {
+        id: "sess-group-b",
+        title: "Group B session",
+        project_path: "/tmp/shared-worktree",
+        group_path: "group-b",
+        branch: "feature/shared",
+      },
+    ]);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+
+    const aggregate = page.locator('[data-testid="sidebar-session-aggregate-row"]');
+    await expect(aggregate).toHaveAttribute("data-session-count", "2");
+    await aggregate.getByTestId("sidebar-session-aggregate-header").click();
+    await expect(page).toHaveURL(/\/$/);
+    await aggregate.getByTestId("sidebar-session-aggregate-header").click({ button: "right" });
+    await expect(page.locator('[data-testid="sidebar-context-menu"]')).toHaveCount(0);
+
+    await page.getByTestId("sidebar-projection-groups").click();
+    const groupA = page.getByRole("link", { name: /Group A session/i });
+    const groupB = page.getByRole("link", { name: /Group B session/i });
+    await expect(groupA).toHaveAttribute("href", /\/session\/sess-group-a$/);
+    await expect(groupB).toHaveAttribute("href", /\/session\/sess-group-b$/);
+
+    await groupA.click();
+    await expect(page).toHaveURL(/\/session\/sess-group-a$/);
+
+    await page.goto("/");
+    await page.getByTestId("sidebar-projection-groups").click();
+    await groupB.click();
+    await expect(page).toHaveURL(/\/session\/sess-group-b$/);
   });
 
   test("distinct branches render their own rows (regression guard)", async ({ page }) => {
