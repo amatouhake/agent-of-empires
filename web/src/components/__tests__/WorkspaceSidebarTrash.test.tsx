@@ -91,6 +91,7 @@ function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSideba
     onSettings: noop,
     onRestoreSession: vi.fn(),
     onDeleteSession: vi.fn(),
+    onDeleteWorkspace: vi.fn(),
     sortMode: "lastActivity",
     onSortModeChange: noop,
     pluginSortRef: null,
@@ -151,7 +152,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
 
     fireEvent.click(screen.getByTestId("sidebar-trash-purge"));
-    expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
+    expect(props.onDeleteWorkspace).toHaveBeenCalledWith("trashed-ws");
   });
 
   it("orders the Trash rows newest-trashed first", () => {
