@@ -581,7 +581,11 @@ enum ClientCmd {
     Cancel,
     /// Force-stop now: end the in-flight turn with `user_forced` and let
     /// the drain task kill the worker process group + respawn. See #1727.
-    ForceStop,
+    ForceStop {
+        /// Test and supervisor ordering acknowledgement. The protocol
+        /// command remains fire-and-forget when no waiter is supplied.
+        respond_to: Option<oneshot::Sender<()>>,
+    },
     SetMode(String),
     /// Send `session/set_config_option` for the given (`config_id`,
     /// `value`) pair. The connection task fires the request detached so
@@ -2328,9 +2332,18 @@ impl AcpClient {
         let saw_delete_task = saw_delete.clone();
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                if let ClientCmd::DeleteSession { respond_to, .. } = cmd {
-                    saw_delete_task.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                match cmd {
+                    ClientCmd::DeleteSession { respond_to, .. } => {
+                        saw_delete_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                    }
+                    ClientCmd::ForceStop {
+                        respond_to: Some(respond_to),
+                    } => {
+                        let _ = respond_to.send(());
+                    }
+                    ClientCmd::ForceStop { respond_to: None } => {}
+                    _ => {}
                 }
             }
         });
@@ -2364,10 +2377,14 @@ impl AcpClient {
         let cmds_task = cmds.clone();
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
+                let mut force_ack = None;
                 let name = match cmd {
                     ClientCmd::Prompt(_) => "prompt",
                     ClientCmd::Cancel => "cancel",
-                    ClientCmd::ForceStop => "force_stop",
+                    ClientCmd::ForceStop { respond_to } => {
+                        force_ack = respond_to;
+                        "force_stop"
+                    }
                     ClientCmd::SetMode(_) => "set_mode",
                     ClientCmd::SetConfigOption { .. } => "set_config_option",
                     ClientCmd::DeleteSession { respond_to, .. } => {
@@ -2383,6 +2400,9 @@ impl AcpClient {
                     ClientCmd::Shutdown => "shutdown",
                 };
                 cmds_task.lock().expect("cmd record mutex").push(name);
+                if let Some(respond_to) = force_ack {
+                    let _ = respond_to.send(());
+                }
             }
         });
         let client = Self {
@@ -2393,6 +2413,44 @@ impl AcpClient {
             _child: None,
         };
         (client, event_tx, cmds)
+    }
+
+    /// Test fake whose force-stop acknowledgement is held behind an explicit
+    /// barrier. This lets supervisor tests prove that the synthetic terminal
+    /// event is not published before the cancel command is acknowledged.
+    #[cfg(test)]
+    pub fn fake_for_test_force_stop_barrier(
+        session_id: AcpSessionId,
+    ) -> (
+        Self,
+        mpsc::Sender<Event>,
+        oneshot::Sender<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        let (release_tx, release_rx) = oneshot::channel();
+        let (seen_tx, seen_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let ClientCmd::ForceStop { respond_to } = cmd {
+                    let _ = seen_tx.send(());
+                    if let Some(respond_to) = respond_to {
+                        let _ = release_rx.await;
+                        let _ = respond_to.send(());
+                    }
+                    break;
+                }
+            }
+        });
+        let client = Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        };
+        (client, event_tx, release_tx, seen_rx)
     }
 
     /// Like `fake_for_test_cmd_recording`, but answers a driven reset
@@ -2932,10 +2990,14 @@ impl AcpClient {
     /// Best-effort: returns Ok even if no turn is in flight. See #1727.
     pub async fn force_cancel(&self) -> Result<(), AcpError> {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        let (respond_to, acknowledged) = oneshot::channel();
         cmd_tx
-            .send(ClientCmd::ForceStop)
+            .send(ClientCmd::ForceStop {
+                respond_to: Some(respond_to),
+            })
             .await
-            .map_err(|_| AcpError::AgentExited)
+            .map_err(|_| AcpError::AgentExited)?;
+        acknowledged.await.map_err(|_| AcpError::AgentExited)
     }
 
     /// Switch the active session mode through the mode channel advertised
@@ -8475,7 +8537,7 @@ async fn run_connection_task<W, R>(
                                                     .await;
                                             }
                                         }
-                                        Some(ClientCmd::ForceStop) => {
+                                        Some(ClientCmd::ForceStop { respond_to }) => {
                                             warn!(
                                                 target: "acp.protocol",
                                                 "force-stop requested during in-flight prompt; ending turn and restarting worker"
@@ -8486,6 +8548,9 @@ async fn run_connection_task<W, R>(
                                             // the drain task kills the process
                                             // group and respawns. See #1727.
                                             let _ = send_session_cancel!();
+                                            if let Some(respond_to) = respond_to {
+                                                let _ = respond_to.send(());
+                                            }
                                             force_stopped = true;
                                             shutdown = true;
                                             break;
@@ -8809,7 +8874,7 @@ async fn run_connection_task<W, R>(
                             })
                             .await;
                     }
-                    Some(ClientCmd::ForceStop) => {
+                    Some(ClientCmd::ForceStop { respond_to }) => {
                         // No prompt in flight: nothing to kill here. The
                         // supervisor's force_end_turn publishes a synthetic
                         // `Stopped` to free a wedged UI (#1100); we only send
@@ -8821,6 +8886,9 @@ async fn run_connection_task<W, R>(
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = send_session_cancel!();
+                        if let Some(respond_to) = respond_to {
+                            let _ = respond_to.send(());
+                        }
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
                         dispatch_set_mode(

@@ -879,6 +879,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         )
     };
     #[cfg(feature = "serve")]
+    let acp_stream_states = acp_event_store
+        .all_stream_states()
+        .context("acp event store: hydrate stream states")?;
+    #[cfg(feature = "serve")]
     let acp_supervisor = {
         // Approval pushes are dispatched from `acp_event_listener`,
         // which subscribes to the broadcast that ChannelSink::publish
@@ -895,7 +899,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         // Seed append state from disk so fresh publishes resume the
         // persisted generation and high-water mark. Without this, after
         // a restart the first publish could collide with restored history.
-        supervisor.hydrate_streams(acp_event_store.all_stream_states());
+        supervisor.hydrate_streams(acp_stream_states);
         supervisor
     };
     #[cfg(feature = "serve")]

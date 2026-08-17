@@ -12,6 +12,8 @@ plugin_root="$repo_root/src/plugin"
 
 raw_methods='wait_until_ready|send_prompt|reset_session_context|cancel_prompt|force_end_turn|set_mode|set_config_option|resolve_permission|resolve_elicitation|publish_user_prompt_with_attachments|publish_user_diff_comments_prompt'
 unrouted_method='cancel_permission'
+runner_raw_methods='agent_request|agent_prompt|agent_cancel|run_or_replay_initialize|run_or_replay_session|intercept_handshake|note_relay_session_new|refresh_session_cache_from_relay|handle_connection|handle_control_connection|cancel_outstanding_requests|write_control_frame'
+lifecycle_paths='reconcile_acp_workers|trigger_resume_background|spawn_inner|shutdown_and_delete|publish_stopped_if_seq|cancel_orphaned_approvals|cancel_orphaned_elicitations'
 
 if [[ "${1:-}" == "--self-test" ]]; then
   fixture=$(mktemp -d)
@@ -27,6 +29,30 @@ if [[ "${1:-}" == "--self-test" ]]; then
     echo "ACP boundary self-test failed to catch the synthetic bypass." >&2
     exit 1
   fi
+
+  cat >"$fixture/lib.rs" <<'EOF'
+mod acp {
+    pub mod supervisor {
+        pub struct Supervisor;
+        impl Supervisor {
+            fn send_prompt(&self) {}
+        }
+    }
+}
+
+mod server {
+    fn compile_negative_boundary(supervisor: &super::acp::supervisor::Supervisor) {
+        supervisor.send_prompt();
+    }
+}
+EOF
+  mkdir -p "$fixture/out"
+  if rustc --edition=2021 --crate-type lib "$fixture/lib.rs" \
+    --out-dir "$fixture/out" 2>"$fixture/compile-negative.stderr"; then
+    echo "ACP boundary compile-negative fixture unexpectedly compiled." >&2
+    exit 1
+  fi
+  echo "ACP boundary compile-negative fixture rejected the raw method."
   exit 0
 fi
 
@@ -66,6 +92,22 @@ if ! rg -n "pub[[:space:]]+async[[:space:]]+fn[[:space:]]+$unrouted_method[[:spa
   exit 1
 fi
 
+for method in ${runner_raw_methods//|/ }; do
+  if ! rg -n --glob '*.rs' "${method}[[:space:]]*\\(" \
+    "$repo_root/src/process/runner.rs" >/dev/null; then
+    echo "Runner raw method disappeared from the inventory: ${method}" >&2
+    exit 1
+  fi
+done
+
+for path in ${lifecycle_paths//|/ }; do
+  if ! rg -n --glob '*.rs' "${path}[[:space:]]*\\(" \
+    "$repo_root/src/acp/supervisor.rs" "$repo_root/src/server" >/dev/null; then
+    echo "ACP lifecycle/reconciler path disappeared from the inventory: ${path}" >&2
+    exit 1
+  fi
+done
+
 echo "ACP raw transport inventory (low-level boundary and explicit maintenance exception):"
 rg -n --glob '*.rs' \
   "($raw_methods)[[:space:]]*\\(" \
@@ -73,4 +115,10 @@ rg -n --glob '*.rs' \
   "$repo_root/src/acp/client" "$repo_root/src/cli/mod.rs" || true
 echo "Intentionally unrouted low-level method:"
 rg -n "$unrouted_method[[:space:]]*\\(" "$repo_root/src/acp/acp_client.rs" || true
+echo "Runner raw relay/lifecycle inventory:"
+rg -n --glob '*.rs' "($runner_raw_methods)[[:space:]]*\\(" \
+  "$repo_root/src/process/runner.rs" || true
+echo "Supervisor/server lifecycle inventory:"
+rg -n --glob '*.rs' "($lifecycle_paths)[[:space:]]*\\(" \
+  "$repo_root/src/acp/supervisor.rs" "$repo_root/src/server" || true
 echo "ACP boundary inventory passed."

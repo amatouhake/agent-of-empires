@@ -3961,12 +3961,10 @@ async fn purge_session_artifacts(
                             );
                         }
                     }
-                    if !state.acp_control_plane.hard_delete_session(id) {
-                        tracing::warn!(
-                            target: "acp.event_store",
-                            session = %id,
-                            "hard deletion of ACP transcript failed after session removal"
-                        );
+                    if let Err(error) = state.acp_control_plane.hard_delete_session(id) {
+                        return Err(format!(
+                            "hard deletion of ACP transcript failed after session removal: {error}"
+                        ));
                     }
                 }
 

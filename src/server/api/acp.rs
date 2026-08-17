@@ -309,7 +309,8 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
         }
         SupervisorError::Acp(_)
         | SupervisorError::InvalidAgentCommand(_)
-        | SupervisorError::SpawnCancelled(_) => (
+        | SupervisorError::SpawnCancelled(_)
+        | SupervisorError::Persistence(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{context}: {err}"),
         )
@@ -2110,7 +2111,18 @@ pub async fn acp_disable(
     // the terminal `claude --resume` reprints the conversation itself, so the
     // tmux pane does not need the AoE event replay, and terminal turns would
     // otherwise leave it stale. See #2252.
-    state.acp_control_plane.forget_session(&id);
+    if let Err(error) = state.acp_control_plane.forget_session(&id) {
+        tracing::error!(
+            target: "acp.switch",
+            session = %id,
+            "structured projection cleanup failed; refusing to complete view switch: {error}"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to clear structured projection: {error}"),
+        )
+            .into_response();
+    }
     if keep_context {
         tracing::debug!(
             target: "acp.switch",

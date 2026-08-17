@@ -8,6 +8,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
@@ -71,6 +72,7 @@ where
 pub struct DbAuthority {
     logical_path: PathBuf,
     opened_identity: String,
+    authority_lost: AtomicBool,
     _opened_file: File,
     _identity_lease: File,
     _bootstrap_lease: BootstrapLease,
@@ -116,6 +118,7 @@ impl DbAuthority {
         let authority = Self {
             logical_path,
             opened_identity,
+            authority_lost: AtomicBool::new(false),
             _opened_file: opened_file,
             _identity_lease: identity_lease,
             _bootstrap_lease: bootstrap_lease,
@@ -128,14 +131,33 @@ impl DbAuthority {
     /// was opened when authority was acquired. Callers use this at mutation
     /// boundaries and before exposing the writer.
     pub fn check_path_identity(&self) -> Result<()> {
-        let current = fs::metadata(&self.logical_path).with_context(|| {
+        if self.authority_lost.load(Ordering::Acquire) {
+            bail!(
+                "ACP database authority is permanently lost for {}",
+                self.logical_path.display()
+            );
+        }
+        let current = match fs::metadata(&self.logical_path).with_context(|| {
             format!(
                 "stat ACP logical database slot {}",
                 self.logical_path.display()
             )
-        })?;
-        let current_identity = file_identity_from_metadata(&current)?;
+        }) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.authority_lost.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let current_identity = match file_identity_from_metadata(&current) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.authority_lost.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
         if current_identity != self.opened_identity {
+            self.authority_lost.store(true, Ordering::Release);
             bail!(
                 "ACP database authority lost: {} now identifies as {}, expected {}",
                 self.logical_path.display(),
@@ -239,6 +261,21 @@ mod tests {
         let replacement = dir.path().join("replacement.db");
         fs::write(&replacement, b"replacement").unwrap();
         fs::rename(&replacement, &path).unwrap();
+        assert!(authority.check_path_identity().is_err());
+    }
+
+    #[test]
+    fn path_restoration_does_not_restore_latched_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acp_events.db");
+        let authority = DbAuthority::acquire(&path).unwrap();
+        let original = dir.path().join("original.db");
+        fs::rename(&path, &original).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(authority.check_path_identity().is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::rename(&original, &path).unwrap();
         assert!(authority.check_path_identity().is_err());
     }
 

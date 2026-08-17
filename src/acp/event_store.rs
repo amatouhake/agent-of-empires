@@ -49,9 +49,12 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+#[cfg(test)]
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use tracing::{debug, trace, warn};
 
 use super::approvals::Nonce;
@@ -81,6 +84,38 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AcpSessionAssigned",
     "PromptCapabilities",
 ];
+
+#[cfg(test)]
+type RecordFailureHook = fn(&str, u64) -> bool;
+
+#[cfg(test)]
+static RECORD_FAILURE_HOOK: OnceLock<Mutex<Option<RecordFailureHook>>> = OnceLock::new();
+
+/// Install a deterministic append-failure seam for persistence tests. This
+/// substitutes the event-store write itself, so authority-loss tests remain
+/// reserved for authority-loss behavior.
+#[cfg(test)]
+pub(crate) fn set_record_failure_hook(hook: Option<RecordFailureHook>) {
+    *RECORD_FAILURE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn record_failure_injected(session_id: &str, seq: u64) -> bool {
+    RECORD_FAILURE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|hook| hook(session_id, seq))
+}
+
+#[cfg(not(test))]
+fn record_failure_injected(_session_id: &str, _seq: u64) -> bool {
+    false
+}
 
 /// What the terminal-repair pass needs to decide, and to publish safely.
 ///
@@ -211,14 +246,14 @@ impl EventStore {
         })
     }
 
-    /// Append one event. Idempotent on duplicate (session_id, seq) thanks
-    /// to the primary key; re-publishing the same seq is a no-op.
-    /// Returns Err when the event was *not* persisted, so the caller can
-    /// surface the gap (e.g. publish a `Lagged` frame on the broadcast
-    /// channel) instead of letting the on-disk log silently fall behind
-    /// the in-memory broadcast subscribers.
+    /// Append one event owned by the ACP publisher. A duplicate seq is an
+    /// error here, even though the generic substrate exposes idempotent
+    /// `INSERT OR IGNORE` semantics to legacy/maintenance writers.
     pub fn record(&self, session_id: &str, seq: u64, event: &Event) -> Result<()> {
         self.authority.check_path_identity()?;
+        if record_failure_injected(session_id, seq) {
+            anyhow::bail!("injected event-store persistence failure at {session_id}@{seq}");
+        }
         let json = serde_json::to_string(event)
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
         let bytes = json.len();
@@ -233,29 +268,16 @@ impl EventStore {
             .with_context(|| format!("begin event append for {session_id}@{seq}"))?;
         let inserted = events::insert_event(&tx, &self.schema, session_id, seq, &json, now_ms)?;
         if inserted == 0 {
-            // Primary-key collision: same (session_id, seq) seen before.
-            // Logged at trace because the cause is usually a benign retry
-            // (publish_user_prompt + replay drain re-publishing) rather
-            // than a bug, but we still want a breadcrumb. Per-event lines
-            // are too noisy to live at debug; they bury the lifecycle
-            // signal in debug.log during an active turn.
-            trace!(
-                target: "acp.event_store",
-                session = %session_id,
-                seq,
-                kind,
-                "skipped duplicate event (already on disk)"
-            );
-        } else {
-            trace!(
-                target: "acp.event_store",
-                session = %session_id,
-                seq,
-                kind,
-                bytes,
-                "recorded event"
-            );
+            anyhow::bail!("duplicate ACP event seq {session_id}@{seq}");
         }
+        trace!(
+            target: "acp.event_store",
+            session = %session_id,
+            seq,
+            kind,
+            bytes,
+            "recorded event"
+        );
         // Prune oldest beyond the retention cap on every insert so the
         // per-session disk bound stays strict rather than amortised.
         // NON_SUBSTANTIVE_EVENT_DISCRIMINANTS are exempt: the agent emits
@@ -274,6 +296,66 @@ impl EventStore {
             .with_context(|| format!("commit event append for {session_id}@{seq}"))?;
         self.authority.check_path_identity()?;
         Ok(())
+    }
+
+    /// Append one event only if the expected stream generation is still
+    /// current. The generation read and event insertion share one SQLite
+    /// write transaction, so a reset cannot slip between validation and
+    /// insertion.
+    pub(crate) fn record_if_generation(
+        &self,
+        session_id: &str,
+        seq: u64,
+        expected_generation: u64,
+        event: &Event,
+    ) -> Result<bool> {
+        self.authority.check_path_identity()?;
+        if record_failure_injected(session_id, seq) {
+            anyhow::bail!("injected event-store persistence failure at {session_id}@{seq}");
+        }
+        let json = serde_json::to_string(event)
+            .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .with_context(|| format!("begin conditional event append for {session_id}@{seq}"))?;
+        let state: Option<(i64, i64)> = tx
+            .query_row(
+                &format!(
+                    "SELECT stream_generation, high_water_seq FROM {} WHERE session_id = ?1",
+                    self.schema.topic_state_table()
+                ),
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .with_context(|| format!("read stream generation for {session_id}"))?;
+        let actual_generation = match state {
+            Some((generation, _)) => u64::try_from(generation)
+                .context("negative stream generation during conditional append")?,
+            None => 1,
+        };
+        if actual_generation != expected_generation {
+            return Ok(false);
+        }
+        let inserted = events::insert_event(&tx, &self.schema, session_id, seq, &json, now_ms)?;
+        if inserted == 0 {
+            anyhow::bail!("duplicate ACP event seq {session_id}@{seq}");
+        }
+        events::prune_retention(
+            &tx,
+            &self.schema,
+            session_id,
+            self.max_events_per_session,
+            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+        );
+        tx.commit()
+            .with_context(|| format!("commit conditional event append for {session_id}@{seq}"))?;
+        self.authority.check_path_identity()?;
+        Ok(true)
     }
 
     /// Test-only: record an event with an explicit `created_at` (ms epoch)
@@ -1020,35 +1102,42 @@ impl EventStore {
     /// Return every session_id that has at least one event stored, with
     /// its highest seq. Used at startup to pre-seed `next_seqs` in one
     /// query rather than racing per-session lookups.
-    pub fn all_session_seqs(&self) -> Vec<(String, u64)> {
+    pub fn all_session_seqs(&self) -> Result<Vec<(String, u64)>> {
+        self.authority.check_path_identity()?;
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let collected = events::all_topic_seqs(&conn, &self.schema);
+        let collected = events::all_topic_seqs(&conn, &self.schema)
+            .context("hydrate persisted ACP sequence states")?;
+        drop(conn);
+        self.authority.check_path_identity()?;
         debug!(
             target: "acp.event_store",
             sessions = collected.len(),
             "all_session_seqs hydration"
         );
-        collected
+        Ok(collected)
     }
 
     /// Return every persisted ACP stream state, including topics whose event
     /// projection was explicitly reset and is currently empty.
-    pub fn all_stream_states(&self) -> Vec<(String, events::TopicState)> {
-        if let Err(e) = self.authority.check_path_identity() {
-            warn!(target: "acp.event_store", "stream-state authority check failed: {e}");
-            return Vec::new();
-        }
+    pub fn all_stream_states(&self) -> Result<Vec<(String, events::TopicState)>> {
+        self.authority.check_path_identity()?;
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        events::all_topic_states(&conn, &self.schema).unwrap_or_else(|e| {
-            warn!(target: "acp.event_store", "stream-state hydration failed: {e}");
-            Vec::new()
-        })
+        let states = events::all_topic_states(&conn, &self.schema)
+            .context("hydrate persisted ACP stream states")?;
+        drop(conn);
+        self.authority.check_path_identity()?;
+        debug!(
+            target: "acp.event_store",
+            streams = states.len(),
+            "all_stream_states hydration"
+        );
+        Ok(states)
     }
 
     /// Read the current durable stream generation for a session. This is used
@@ -1791,45 +1880,47 @@ impl EventStore {
         }
     }
 
-    /// Drop every event for a session. Called when the session is
-    /// deleted or its view is switched away from structured view, so the
-    /// next acp_enable starts fresh from seq=1.
-    pub fn delete_session(&self, session_id: &str) -> bool {
-        if let Err(e) = self.authority.check_path_identity() {
-            warn!(target: "acp.event_store", "session reset authority check failed: {e}");
-            return false;
-        }
+    /// Forget a structured projection and begin a fresh stream generation.
+    /// Called when the session is deleted or its view is switched away from
+    /// structured view.
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.authority.check_path_identity()?;
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        match events::forget_topic(&conn, &self.schema, session_id) {
-            Ok(deleted) => {
-                if let Err(e) = self.authority.check_path_identity() {
-                    warn!(
-                        target: "acp.event_store",
-                        session = %session_id,
-                        "session reset authority lost after commit: {e}"
-                    );
-                    return false;
-                }
-                debug!(
-                    target: "acp.event_store",
-                    session = %session_id,
-                    deleted,
-                    "forgot session event projection"
-                );
-                true
-            }
-            Err(e) => {
-                warn!(
-                    target: "acp.event_store",
-                    session = %session_id,
-                    "failed to forget session event projection: {e}"
-                );
-                false
-            }
-        }
+        let deleted = events::forget_topic(&conn, &self.schema, session_id)
+            .with_context(|| format!("forget session event projection for {session_id}"))?;
+        drop(conn);
+        self.authority.check_path_identity()?;
+        debug!(
+            target: "acp.event_store",
+            session = %session_id,
+            deleted,
+            "forgot session event projection"
+        );
+        Ok(())
+    }
+
+    /// Clear an imported/replayed projection while preserving the current
+    /// stream generation and durable allocation floor.
+    pub fn reseed_session(&self, session_id: &str) -> Result<()> {
+        self.authority.check_path_identity()?;
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let deleted = events::reseed_topic(&conn, &self.schema, session_id)
+            .with_context(|| format!("reseed session event projection for {session_id}"))?;
+        drop(conn);
+        self.authority.check_path_identity()?;
+        debug!(
+            target: "acp.event_store",
+            session = %session_id,
+            deleted,
+            "reseeded session event projection"
+        );
+        Ok(())
     }
 
     /// Permanently remove a session's event projection, attachments, and
@@ -2039,6 +2130,71 @@ mod tests {
             text: text.into(),
             attachments: vec![],
         }
+    }
+
+    #[test]
+    fn append_owner_rejects_duplicate_seq_instead_of_reporting_success() {
+        let (_tmp, store) = open_store(100);
+        store.record("duplicate", 1, &user_prompt("first")).unwrap();
+        assert!(store.record("duplicate", 1, &user_prompt("retry")).is_err());
+        assert_eq!(store.replay_from("duplicate", 0).len(), 1);
+        assert_eq!(store.stream_state("duplicate").unwrap().high_water_seq, 1);
+    }
+
+    #[test]
+    fn conditional_append_rejects_a_reset_stale_reservation() {
+        let (_tmp, store) = open_store(100);
+        store.record("stale", 1, &user_prompt("before")).unwrap();
+        let generation = store.stream_state("stale").unwrap().stream_generation;
+        store.delete_session("stale").unwrap();
+
+        assert!(!store
+            .record_if_generation("stale", 2, generation, &user_prompt("stale"))
+            .unwrap());
+        assert!(store.replay_from("stale", 0).is_empty());
+        assert_eq!(
+            store.stream_state("stale").unwrap(),
+            events::TopicState {
+                stream_generation: generation + 1,
+                high_water_seq: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn stream_hydration_fails_closed_and_authority_loss_stays_latched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("acp.db");
+        let store = EventStore::open(&path, 100).unwrap();
+        let original = tmp.path().join("acp.original.db");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+
+        assert!(store.all_stream_states().is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&original, &path).unwrap();
+        assert!(store.all_stream_states().is_err());
+    }
+
+    #[test]
+    fn stream_hydration_propagates_sqlite_failure_instead_of_empty_state() {
+        let (tmp, store) = open_store(100);
+        let conn = Connection::open(tmp.path().join("acp.db")).unwrap();
+        conn.execute("DROP TABLE acp_event_topics", []).unwrap();
+
+        assert!(store.all_stream_states().is_err());
+    }
+
+    #[test]
+    fn conditional_append_fails_closed_when_generation_read_fails() {
+        let (tmp, store) = open_store(100);
+        let conn = Connection::open(tmp.path().join("acp.db")).unwrap();
+        conn.execute("DROP TABLE acp_event_topics", []).unwrap();
+
+        assert!(store
+            .record_if_generation("generation-error", 1, 1, &user_prompt("blocked"))
+            .is_err());
+        assert!(store.replay_from("generation-error", 0).is_empty());
     }
 
     #[test]
@@ -2358,7 +2514,7 @@ mod tests {
             .record("s-2", 1, &prompt_with_attachment("b1"))
             .unwrap();
         store.record_attachment("s-2", 1, &img_blob("b1"));
-        store.delete_session("s-1");
+        store.delete_session("s-1").unwrap();
         assert!(store.load_attachment("s-1", "a1").is_none());
         // Sibling session untouched.
         assert!(store.load_attachment("s-2", "b1").is_some());
@@ -2664,7 +2820,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_seq_is_idempotent() {
+    fn duplicate_seq_is_rejected_by_append_owner() {
         let (_tmp, store) = open_store(1000);
         store
             .record(
@@ -2676,8 +2832,9 @@ mod tests {
                 },
             )
             .unwrap();
-        // Second insert at the same seq must not double-count.
-        store.record("s-1", 1, &Event::ThinkingStarted).unwrap();
+        // The generic substrate remains idempotent, but the ACP append owner
+        // must not report a duplicate as fresh persistence.
+        assert!(store.record("s-1", 1, &Event::ThinkingStarted).is_err());
         let replay = store.replay_from("s-1", 0);
         assert_eq!(replay.len(), 1);
         // The first write wins (INSERT OR IGNORE).
@@ -2944,7 +3101,7 @@ mod tests {
         let (_tmp, store) = open_store(1000);
         store.record("s-1", 1, &Event::ThinkingStarted).unwrap();
         store.record("s-2", 1, &Event::ThinkingEnded).unwrap();
-        store.delete_session("s-1");
+        store.delete_session("s-1").unwrap();
         assert_eq!(store.highest_seq("s-1"), 0);
         assert_eq!(store.highest_seq("s-2"), 1);
     }
@@ -2955,7 +3112,7 @@ mod tests {
         store.record("s-1", 1, &Event::ThinkingStarted).unwrap();
         store.record("s-1", 2, &Event::ThinkingEnded).unwrap();
         store.record("s-2", 1, &Event::ThinkingStarted).unwrap();
-        let mut listed = store.all_session_seqs();
+        let mut listed = store.all_session_seqs().unwrap();
         listed.sort();
         assert_eq!(listed, vec![("s-1".to_string(), 2), ("s-2".to_string(), 1)]);
     }

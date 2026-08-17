@@ -378,6 +378,10 @@ fn test_cross_process_blocking_acquire() -> Result<()> {
 fn test_lock_released_on_panic_unwind() -> Result<()> {
     let temp = setup_temp_home();
     let home = temp.path().to_path_buf();
+    // Keep the timing assertion focused on the storage lock. A fresh child
+    // would otherwise spend the budget running the full schema migration
+    // chain before it can attempt the lock.
+    agent_of_empires::migrations::run_migrations()?;
 
     let storage = Storage::new_unwatched("default")?;
     storage.update(|instances, _groups| {

@@ -33,12 +33,14 @@ mod v022_prune_tuning_settings;
 mod v023_clear_structured_container_error;
 
 use anyhow::Result;
-use std::fs;
+use fs2::FileExt;
+use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use tracing::{debug, info};
 
 const CURRENT_VERSION: u32 = 23;
 const VERSION_FILE: &str = ".schema_version";
+const MIGRATION_LOCK_FILE: &str = ".schema_version.lock";
 
 struct Migration {
     version: u32,
@@ -186,6 +188,19 @@ pub fn run_migrations() -> Result<()> {
         return Ok(());
     }
 
+    // Several CLI processes can start from a fresh app directory at once.
+    // Serialize the complete version read, migration sequence, and version
+    // writes so only one process can enter v012's bootstrap lease path. The
+    // second read is required because every waiter may have observed the
+    // pre-migration version before it acquired this lock.
+    let _lock = acquire_migration_lock()?;
+    let current = get_current_version();
+    debug!("Current schema version after migration lock: {}", current);
+
+    if current >= CURRENT_VERSION {
+        return Ok(());
+    }
+
     for migration in MIGRATIONS {
         if migration.version > current {
             let start = std::time::Instant::now();
@@ -208,6 +223,19 @@ pub fn run_migrations() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn acquire_migration_lock() -> Result<File> {
+    let dir = crate::session::get_app_dir()?;
+    let path = dir.join(MIGRATION_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.lock_exclusive()?;
+    Ok(file)
 }
 
 /// Get the current schema version by checking all possible locations.

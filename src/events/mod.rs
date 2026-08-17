@@ -292,10 +292,13 @@ fn normalize_sql(sql: &str) -> String {
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(test)]
-static TOPIC_MIGRATION_HOOK: OnceLock<Mutex<Option<fn(&str)>>> = OnceLock::new();
+type TopicMigrationHook = fn(&str);
 
 #[cfg(test)]
-pub(crate) fn set_topic_migration_hook(hook: Option<fn(&str)>) {
+static TOPIC_MIGRATION_HOOK: OnceLock<Mutex<Option<TopicMigrationHook>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_topic_migration_hook(hook: Option<TopicMigrationHook>) {
     *TOPIC_MIGRATION_HOOK
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -340,7 +343,7 @@ pub fn topic_state(conn: &Connection, schema: &Schema, topic: &str) -> Result<To
     }
     Ok(TopicState {
         stream_generation: 1,
-        high_water_seq: highest_seq(conn, schema, topic),
+        high_water_seq: highest_seq_result(conn, schema, topic)?,
     })
 }
 
@@ -357,16 +360,24 @@ pub fn all_topic_states(conn: &Connection, schema: &Schema) -> Result<Vec<(Strin
     let rows = stmt.query_map([], |row| {
         let generation: i64 = row.get(1)?;
         let high_water: i64 = row.get(2)?;
-        Ok((
-            row.get::<_, String>(0)?,
-            TopicState {
-                stream_generation: generation as u64,
-                high_water_seq: high_water as u64,
-            },
-        ))
+        Ok((row.get::<_, String>(0)?, generation, high_water))
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("read event topic state hydration")
+    let rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("read event topic state hydration")?;
+    rows.into_iter()
+        .map(|(topic, generation, high_water)| {
+            Ok((
+                topic,
+                TopicState {
+                    stream_generation: u64::try_from(generation)
+                        .context("negative stream generation during hydration")?,
+                    high_water_seq: u64::try_from(high_water)
+                        .context("negative stream high-water during hydration")?,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Ensure the `discriminant` column and its lookup index exist, backfilling
@@ -651,22 +662,28 @@ pub fn scan(
     out
 }
 
-/// Highest seq stored for `topic`, or 0 if none.
+/// Highest seq stored for `topic`, or 0 if none. This compatibility helper is
+/// for best-effort replay/read paths; authority and hydration callers use
+/// [`highest_seq_result`] so SQLite failures cannot become a false zero.
 pub fn highest_seq(conn: &Connection, schema: &Schema, topic: &str) -> u64 {
-    match conn
+    highest_seq_result(conn, schema, topic).unwrap_or(0)
+}
+
+/// Fallible highest-seq query for persistence and startup paths.
+pub fn highest_seq_result(conn: &Connection, schema: &Schema, topic: &str) -> Result<u64> {
+    let max: Option<i64> = conn
         .query_row(
             &format!(
                 "SELECT MAX(seq) FROM {} WHERE session_id = ?1",
                 schema.events_table()
             ),
             params![topic],
-            |row| row.get::<_, Option<i64>>(0),
+            |row| row.get(0),
         )
-        .optional()
-    {
-        Ok(Some(Some(max))) => max as u64,
-        _ => 0,
-    }
+        .with_context(|| format!("read highest seq for {topic}"))?;
+    max.map(|value| u64::try_from(value).context("negative highest seq"))
+        .transpose()
+        .map(|value| value.unwrap_or(0))
 }
 
 /// Lowest seq still stored for `topic`, or `None` when empty.
@@ -689,30 +706,28 @@ pub fn lowest_seq(conn: &Connection, schema: &Schema, topic: &str) -> Option<u64
 
 /// Every topic with at least one event, paired with its highest seq, in one
 /// query. Used to re-seed per-topic seq counters at startup.
-pub fn all_topic_seqs(conn: &Connection, schema: &Schema) -> Vec<(String, u64)> {
+pub fn all_topic_seqs(conn: &Connection, schema: &Schema) -> Result<Vec<(String, u64)>> {
     let sql = format!(
         "SELECT session_id, MAX(seq) FROM {} GROUP BY session_id",
         schema.events_table()
     );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(target: "events", "prepare all_topic_seqs: {e}");
-            return Vec::new();
-        }
-    };
-    let rows = match stmt.query_map([], |row| {
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("prepare all topic sequence hydration")?;
+    let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
         let max: i64 = row.get(1)?;
-        Ok((id, max as u64))
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(target: "events", "query all_topic_seqs: {e}");
-            return Vec::new();
-        }
-    };
-    rows.filter_map(|r| r.ok()).collect()
+        Ok((id, max))
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(topic, max)| {
+            Ok((
+                topic,
+                u64::try_from(max).context("negative highest seq during hydration")?,
+            ))
+        })
+        .collect()
 }
 
 /// Most recent `created_at` per topic among `topics`, excluding events
@@ -959,6 +974,61 @@ pub fn forget_topic(conn: &Connection, schema: &Schema, topic: &str) -> Result<u
     Ok(deleted)
 }
 
+/// Clear a topic's retained projection for an import/history reseed while
+/// preserving the current stream generation and durable allocation floor.
+///
+/// This is intentionally distinct from [`forget_topic`]. A structured-view
+/// disable starts a new stream identity, while an import cleanup removes the
+/// partial projection but must leave the live stream allocator unchanged.
+pub fn reseed_topic(conn: &Connection, schema: &Schema, topic: &str) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .with_context(|| format!("begin event topic reseed for {topic}"))?;
+    let before: Option<(i64, i64)> = tx
+        .query_row(
+            &format!(
+                "SELECT stream_generation, high_water_seq FROM {} WHERE session_id = ?1",
+                schema.topic_state_table()
+            ),
+            params![topic],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("read event topic reseed state for {topic}"))?;
+    let deleted = tx
+        .execute(
+            &format!(
+                "DELETE FROM {} WHERE session_id = ?1",
+                schema.events_table()
+            ),
+            params![topic],
+        )
+        .with_context(|| format!("delete event topic rows for reseed {topic}"))?;
+    tx.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1",
+            schema.attachments_table()
+        ),
+        params![topic],
+    )
+    .with_context(|| format!("delete event topic attachments for reseed {topic}"))?;
+
+    if let Some((generation, high_water)) = before {
+        tx.execute(
+            &format!(
+                "UPDATE {} SET stream_generation = ?2, high_water_seq = ?3
+                   WHERE session_id = ?1",
+                schema.topic_state_table()
+            ),
+            params![topic, generation, high_water],
+        )
+        .with_context(|| format!("restore event topic reseed state for {topic}"))?;
+    }
+    tx.commit()
+        .with_context(|| format!("commit event topic reseed for {topic}"))?;
+    Ok(deleted)
+}
+
 /// Permanently remove a topic's events, attachments, and stream metadata in
 /// one transaction. This is the maintenance operation used by hard purge;
 /// it ends the topic identity rather than creating a new generation.
@@ -1073,7 +1143,7 @@ mod tests {
         );
         assert_eq!(back, vec![(3, "\"e3\"".into()), (2, "\"e2\"".into())]);
 
-        let mut seqs = all_topic_seqs(&conn, &schema);
+        let mut seqs = all_topic_seqs(&conn, &schema).unwrap();
         seqs.sort();
         assert_eq!(seqs, vec![("a".into(), 3), ("b".into(), 1)]);
 
@@ -1137,7 +1207,22 @@ mod tests {
         insert_event(&conn, &schema, "t", 1, "{\"Chunk\":{}}", 5).unwrap();
         assert_eq!(topic_state(&conn, &schema, "t").unwrap().high_water_seq, 1);
 
-        forget_topic(&conn, &schema, "t").unwrap();
+        // A legacy writer can append above the former high-water after the
+        // reset; the trigger makes that new durable floor authoritative.
+        insert_event(&conn, &schema, "t", 8, "{\"Chunk\":{}}", 6).unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap(),
+            TopicState {
+                stream_generation: 2,
+                high_water_seq: 8
+            }
+        );
+
+        // A legacy whole-topic delete must advance the generation even when
+        // it removes the rows directly, then allow a post-HWM reappend in the
+        // new generation.
+        conn.execute("DELETE FROM demo_events WHERE session_id = 't'", [])
+            .unwrap();
         assert_eq!(
             topic_state(&conn, &schema, "t").unwrap(),
             TopicState {
@@ -1145,11 +1230,92 @@ mod tests {
                 high_water_seq: 0
             }
         );
+        insert_event(&conn, &schema, "t", 9, "{\"Chunk\":{}}", 7).unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap(),
+            TopicState {
+                stream_generation: 3,
+                high_water_seq: 9
+            }
+        );
+
+        forget_topic(&conn, &schema, "t").unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap(),
+            TopicState {
+                stream_generation: 4,
+                high_water_seq: 0
+            }
+        );
         // Empty-topic reset is explicit because no DELETE trigger can fire.
         forget_topic(&conn, &schema, "t").unwrap();
         assert_eq!(
             topic_state(&conn, &schema, "t").unwrap().stream_generation,
+            5
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reseed_preserves_stream_identity_and_allocation_floor() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        install_topic_state(&conn, &schema).unwrap();
+        insert_event(&conn, &schema, "import", 4, "{\"Chunk\":{}}", 1).unwrap();
+        conn.execute(
+            "UPDATE demo_event_topics SET stream_generation = 9 WHERE session_id = 'import'",
+            [],
+        )
+        .unwrap();
+        insert_attachment(
+            &conn,
+            &schema,
+            "import",
+            4,
+            "att",
+            "image",
+            "image/png",
+            None,
+            b"bytes",
+            1,
+        );
+
+        reseed_topic(&conn, &schema, "import").unwrap();
+        assert!(scan(
+            &conn,
+            &schema,
+            "import",
+            SeqBound::After(0),
+            Order::Asc,
+            None
+        )
+        .is_empty());
+        assert!(load_attachment(&conn, &schema, "import", "att").is_none());
+        assert_eq!(
+            topic_state(&conn, &schema, "import").unwrap(),
+            TopicState {
+                stream_generation: 9,
+                high_water_seq: 4,
+            }
+        );
+
+        // A legacy writer may reuse a low seq after the projection was
+        // cleared, but the preserved floor remains authoritative.
+        insert_event(&conn, &schema, "import", 1, "{\"Chunk\":{}}", 2).unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "import")
+                .unwrap()
+                .high_water_seq,
             4
+        );
+
+        forget_topic(&conn, &schema, "import").unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "import").unwrap(),
+            TopicState {
+                stream_generation: 10,
+                high_water_seq: 0,
+            }
         );
     }
 
@@ -1195,6 +1361,82 @@ mod tests {
         set_topic_migration_hook(None);
         assert!(table_exists(&conn, schema.topic_state_table()));
         verify_topic_state_triggers(&conn, &schema).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_backed_topic_migration_reopens_after_precommit_crash_cutpoint() {
+        fn panic_before_triggers(name: &str) {
+            if name == TOPIC_INSERT_MIGRATION_CUTPOINT {
+                panic!("injected file-backed migration failure");
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.db");
+        let schema = Schema::new("demo").unwrap();
+        {
+            let conn = open(&path, &schema).unwrap();
+            insert_event(&conn, &schema, "reopen", 7, "{\"Chunk\":{}}", 1).unwrap();
+            set_topic_migration_hook(Some(panic_before_triggers));
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                install_topic_state(&conn, &schema).unwrap();
+            }))
+            .is_err());
+            set_topic_migration_hook(None);
+        }
+
+        let conn = open(&path, &schema).unwrap();
+        assert!(!table_exists(&conn, schema.topic_state_table()));
+        install_topic_state(&conn, &schema).unwrap();
+        verify_topic_state_triggers(&conn, &schema).unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "reopen")
+                .unwrap()
+                .high_water_seq,
+            7
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_backed_postcommit_failure_leaves_verified_store_but_no_writer() {
+        fn panic_after_commit(name: &str) {
+            if name == TOPIC_COMMIT_MIGRATION_CUTPOINT {
+                panic!("injected post-commit migration failure");
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.db");
+        let schema = Schema::new("demo").unwrap();
+        {
+            let conn = open(&path, &schema).unwrap();
+            set_topic_migration_hook(Some(panic_after_commit));
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                install_topic_state(&conn, &schema).unwrap();
+            }))
+            .is_err());
+            set_topic_migration_hook(None);
+        }
+
+        let conn = open(&path, &schema).unwrap();
+        assert!(table_exists(&conn, schema.topic_state_table()));
+        verify_topic_state_triggers(&conn, &schema).unwrap();
+        drop(conn);
+
+        set_topic_migration_hook(Some(panic_after_commit));
+        let open_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::acp::event_store::EventStore::open(&path, 100).unwrap();
+        }));
+        set_topic_migration_hook(None);
+        assert!(
+            open_result.is_err(),
+            "writer must not be returned before verification"
+        );
+
+        let store = crate::acp::event_store::EventStore::open(&path, 100).unwrap();
+        assert!(store.all_stream_states().is_ok());
     }
 
     #[test]

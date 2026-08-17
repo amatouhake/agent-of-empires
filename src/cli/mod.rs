@@ -357,6 +357,59 @@ mod tests {
         assert_eq!(kept_events, 1, "other session must be untouched");
     }
 
+    #[cfg(feature = "serve")]
+    #[test]
+    fn purge_acp_transcript_rows_works_against_installed_store_while_lease_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("acp_events.db");
+        let store = crate::acp::event_store::EventStore::open(&db_path, 100).unwrap();
+        store
+            .record("drop", 1, &crate::acp::state::Event::ThinkingStarted)
+            .unwrap();
+        store
+            .record("keep", 1, &crate::acp::state::Event::ThinkingEnded)
+            .unwrap();
+        let blob = crate::acp::event_store::AttachmentBlob {
+            id: "attachment".into(),
+            kind: crate::acp::state::PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: None,
+            data: b"bytes".to_vec(),
+        };
+        assert!(store.record_attachment("drop", 1, &blob));
+
+        // The live EventStore retains the daemon's logical and opened-file
+        // leases while the external maintenance writer purges the topic.
+        purge_acp_transcript_rows(&db_path, "drop").unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let dropped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'drop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dropped_attachments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_attachments WHERE session_id = 'drop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(dropped_attachments, 0);
+        assert_eq!(kept, 1);
+        drop(conn);
+        assert!(store.replay_from("drop", 0).is_empty());
+    }
+
     // A store that predates a table (or any expected table missing) is not an
     // error: there is simply nothing to purge.
     #[test]
