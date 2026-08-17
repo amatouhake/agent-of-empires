@@ -138,7 +138,12 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
     // "acp"), which is serve-gated and so cannot be referenced from here. They
     // are fixed literals, not user input, and `session_id` is bound, so the
     // `format!` only interpolates a constant.
-    for table in ["acp_events", "acp_attachments"] {
+    // This is the explicit external maintenance-writer exception in the
+    // Phase-A inventory. It is intentionally not routed through the daemon's
+    // semantic control plane, so the metadata row is removed in the same
+    // transaction as events and attachments while a live daemon may still
+    // hold the SQLite file open.
+    for table in ["acp_events", "acp_attachments", "acp_event_topics"] {
         match tx.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
             rusqlite::params![session_id],

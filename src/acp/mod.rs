@@ -20,6 +20,7 @@ pub mod agent_policy;
 pub mod agent_profiles;
 pub mod agent_registry;
 pub mod approvals;
+pub mod authority;
 pub mod background_agent;
 pub mod capability_probe;
 pub mod client;

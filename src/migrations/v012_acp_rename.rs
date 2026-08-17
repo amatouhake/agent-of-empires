@@ -59,7 +59,8 @@ pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
     // Persisted ACP transcript database (file + tables). Without this, an
     // upgraded binary opens a fresh empty `acp_events.db` and every prior
     // session's history is orphaned in the old `cockpit_events.db`.
-    relocate_events_db(app_dir)?;
+    let acp_db = app_dir.join("acp_events.db");
+    crate::acp_authority::with_bootstrap_lease(&acp_db, || relocate_events_db(app_dir))?;
 
     Ok(())
 }

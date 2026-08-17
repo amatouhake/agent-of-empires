@@ -35,6 +35,9 @@ use tracing::{debug, warn};
 pub struct Schema {
     events_table: String,
     attachments_table: String,
+    topic_state_table: String,
+    insert_trigger: String,
+    delete_trigger: String,
 }
 
 impl Schema {
@@ -48,6 +51,9 @@ impl Schema {
         Ok(Self {
             events_table: format!("{prefix}_events"),
             attachments_table: format!("{prefix}_attachments"),
+            topic_state_table: format!("{prefix}_event_topics"),
+            insert_trigger: format!("{prefix}_events_topic_insert"),
+            delete_trigger: format!("{prefix}_events_topic_delete"),
         })
     }
 
@@ -58,7 +64,21 @@ impl Schema {
     pub fn attachments_table(&self) -> &str {
         &self.attachments_table
     }
+
+    pub fn topic_state_table(&self) -> &str {
+        &self.topic_state_table
+    }
 }
+
+/// Durable stream identity and committed high-water for one event topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopicState {
+    pub stream_generation: u64,
+    pub high_water_seq: u64,
+}
+
+const TOPIC_INSERT_MIGRATION_CUTPOINT: &str = "after_backfill_before_triggers";
+const TOPIC_COMMIT_MIGRATION_CUTPOINT: &str = "after_commit_before_verification";
 
 /// Which side of a seq cursor a [`scan`] window sits on.
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +167,207 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     .context("create event log schema")?;
     ensure_discriminant_column(&conn, events)?;
     Ok(conn)
+}
+
+/// Install the durable stream-generation table and its legacy-writer-aware
+/// triggers in one SQLite write transaction. This transaction is the only
+/// supported first-install or re-upgrade boundary for topic metadata.
+pub fn install_topic_state(conn: &Connection, schema: &Schema) -> Result<()> {
+    let events = schema.events_table();
+    let topics = schema.topic_state_table();
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin event topic metadata migration")?;
+    tx.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {topics} (
+            session_id        TEXT PRIMARY KEY,
+            stream_generation INTEGER NOT NULL DEFAULT 1 CHECK(stream_generation >= 1),
+            high_water_seq    INTEGER NOT NULL DEFAULT 0 CHECK(high_water_seq >= 0)
+         );
+         INSERT OR IGNORE INTO {topics} (session_id, stream_generation, high_water_seq)
+         SELECT session_id, 1, COALESCE(MAX(seq), 0)
+           FROM {events}
+          GROUP BY session_id;
+         UPDATE {topics}
+            SET high_water_seq = MAX(
+                high_water_seq,
+                COALESCE((
+                    SELECT MAX(seq) FROM {events}
+                     WHERE {events}.session_id = {topics}.session_id
+                ), 0)
+            );"
+    ))
+    .context("backfill event topic metadata")?;
+    migration_cutpoint(TOPIC_INSERT_MIGRATION_CUTPOINT);
+    tx.execute_batch(&format!(
+        "DROP TRIGGER IF EXISTS {};
+         DROP TRIGGER IF EXISTS {};
+         {};
+         {};",
+        schema.insert_trigger,
+        schema.delete_trigger,
+        topic_insert_trigger_sql(schema),
+        topic_delete_trigger_sql(schema)
+    ))
+    .context("install event topic triggers")?;
+    tx.commit()
+        .context("commit event topic metadata migration")?;
+    migration_cutpoint(TOPIC_COMMIT_MIGRATION_CUTPOINT);
+    verify_topic_state_triggers(conn, schema)
+}
+
+/// Verify the persistent trigger definitions after the migration commit and
+/// before exposing an EventStore writer to callers.
+pub fn verify_topic_state_triggers(conn: &Connection, schema: &Schema) -> Result<()> {
+    for (name, expected) in [
+        (&schema.insert_trigger, topic_insert_trigger_sql(schema)),
+        (&schema.delete_trigger, topic_delete_trigger_sql(schema)),
+    ] {
+        let actual: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| format!("read event topic trigger {name}"))?;
+        let Some(actual) = actual else {
+            anyhow::bail!("event topic trigger {name} is missing after migration");
+        };
+        if normalize_sql(&actual) != normalize_sql(&expected) {
+            anyhow::bail!("event topic trigger {name} has an unexpected definition");
+        }
+    }
+    Ok(())
+}
+
+fn topic_insert_trigger_sql(schema: &Schema) -> String {
+    format!(
+        "CREATE TRIGGER {trigger}
+         AFTER INSERT ON {events}
+         WHEN NOT EXISTS (
+             SELECT 1 FROM {topics} WHERE session_id = NEW.session_id
+         ) OR NEW.seq > COALESCE((
+             SELECT high_water_seq FROM {topics} WHERE session_id = NEW.session_id
+         ), 0)
+         BEGIN
+             INSERT INTO {topics} (session_id, stream_generation, high_water_seq)
+             VALUES (NEW.session_id, 1, NEW.seq)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 high_water_seq = MAX({topics}.high_water_seq, excluded.high_water_seq);
+         END",
+        trigger = schema.insert_trigger,
+        events = schema.events_table(),
+        topics = schema.topic_state_table(),
+    )
+}
+
+fn topic_delete_trigger_sql(schema: &Schema) -> String {
+    format!(
+        "CREATE TRIGGER {trigger}
+         AFTER DELETE ON {events}
+         WHEN OLD.seq = (
+             SELECT high_water_seq FROM {topics} WHERE session_id = OLD.session_id
+         )
+         BEGIN
+             UPDATE {topics}
+                SET stream_generation = stream_generation + 1,
+                    high_water_seq = 0
+              WHERE session_id = OLD.session_id
+                AND high_water_seq = OLD.seq;
+         END",
+        trigger = schema.delete_trigger,
+        events = schema.events_table(),
+        topics = schema.topic_state_table(),
+    )
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+static TOPIC_MIGRATION_HOOK: OnceLock<Mutex<Option<fn(&str)>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_topic_migration_hook(hook: Option<fn(&str)>) {
+    *TOPIC_MIGRATION_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn migration_cutpoint(name: &str) {
+    if let Some(hook) = TOPIC_MIGRATION_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .copied()
+    {
+        hook(name);
+    }
+}
+
+#[cfg(not(test))]
+fn migration_cutpoint(_name: &str) {}
+
+/// Read a topic's committed stream state. A missing row is treated as the
+/// pre-install state and rebased from retained event rows.
+pub fn topic_state(conn: &Connection, schema: &Schema, topic: &str) -> Result<TopicState> {
+    let state: Option<(i64, i64)> = conn
+        .query_row(
+            &format!(
+                "SELECT stream_generation, high_water_seq FROM {} WHERE session_id = ?1",
+                schema.topic_state_table()
+            ),
+            params![topic],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("read event topic state for {topic}"))?;
+    if let Some((generation, high_water)) = state {
+        return Ok(TopicState {
+            stream_generation: u64::try_from(generation).context("negative stream generation")?,
+            high_water_seq: u64::try_from(high_water).context("negative stream high-water")?,
+        });
+    }
+    Ok(TopicState {
+        stream_generation: 1,
+        high_water_seq: highest_seq(conn, schema, topic),
+    })
+}
+
+/// Read every persisted topic state, including empty topics retained by an
+/// explicit projection reset.
+pub fn all_topic_states(conn: &Connection, schema: &Schema) -> Result<Vec<(String, TopicState)>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT session_id, stream_generation, high_water_seq
+               FROM {} ORDER BY session_id",
+            schema.topic_state_table()
+        ))
+        .context("prepare event topic state hydration")?;
+    let rows = stmt.query_map([], |row| {
+        let generation: i64 = row.get(1)?;
+        let high_water: i64 = row.get(2)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            TopicState {
+                stream_generation: generation as u64,
+                high_water_seq: high_water as u64,
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("read event topic state hydration")
 }
 
 /// Ensure the `discriminant` column and its lookup index exist, backfilling
@@ -669,6 +890,113 @@ pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
     deleted
 }
 
+/// Forget a topic while preserving its stream identity. The persistent delete
+/// trigger advances a non-empty topic exactly once; the explicit update covers
+/// the empty-topic case where no row deletion can fire a trigger.
+pub fn forget_topic(conn: &Connection, schema: &Schema, topic: &str) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .with_context(|| format!("begin event topic reset for {topic}"))?;
+    let before: Option<(i64, i64)> = tx
+        .query_row(
+            &format!(
+                "SELECT stream_generation, high_water_seq FROM {} WHERE session_id = ?1",
+                schema.topic_state_table()
+            ),
+            params![topic],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("read event topic reset state for {topic}"))?;
+    let deleted = tx
+        .execute(
+            &format!(
+                "DELETE FROM {} WHERE session_id = ?1",
+                schema.events_table()
+            ),
+            params![topic],
+        )
+        .with_context(|| format!("delete event topic rows for {topic}"))?;
+    tx.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1",
+            schema.attachments_table()
+        ),
+        params![topic],
+    )
+    .with_context(|| format!("delete event topic attachments for {topic}"))?;
+
+    if let Some((before_generation, _)) = before {
+        let after_generation: i64 = tx.query_row(
+            &format!(
+                "SELECT stream_generation FROM {} WHERE session_id = ?1",
+                schema.topic_state_table()
+            ),
+            params![topic],
+            |row| row.get(0),
+        )?;
+        if after_generation == before_generation {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET stream_generation = stream_generation + 1,
+                                    high_water_seq = 0
+                       WHERE session_id = ?1",
+                    schema.topic_state_table()
+                ),
+                params![topic],
+            )?;
+        } else {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET high_water_seq = 0 WHERE session_id = ?1",
+                    schema.topic_state_table()
+                ),
+                params![topic],
+            )?;
+        }
+    }
+    tx.commit()
+        .with_context(|| format!("commit event topic reset for {topic}"))?;
+    Ok(deleted)
+}
+
+/// Permanently remove a topic's events, attachments, and stream metadata in
+/// one transaction. This is the maintenance operation used by hard purge;
+/// it ends the topic identity rather than creating a new generation.
+pub fn hard_delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .with_context(|| format!("begin hard event topic purge for {topic}"))?;
+    let deleted = tx
+        .execute(
+            &format!(
+                "DELETE FROM {} WHERE session_id = ?1",
+                schema.events_table()
+            ),
+            params![topic],
+        )
+        .with_context(|| format!("delete event topic rows for {topic}"))?;
+    tx.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1",
+            schema.attachments_table()
+        ),
+        params![topic],
+    )
+    .with_context(|| format!("delete event topic attachments for {topic}"))?;
+    tx.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1",
+            schema.topic_state_table()
+        ),
+        params![topic],
+    )
+    .with_context(|| format!("delete event topic metadata for {topic}"))?;
+    tx.commit()
+        .with_context(|| format!("commit hard event topic purge for {topic}"))?;
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +1081,131 @@ mod tests {
         assert_eq!(delete_topic(&conn, &schema, "a"), 3);
         assert_eq!(highest_seq(&conn, &schema, "a"), 0);
         assert_eq!(highest_seq(&conn, &schema, "b"), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topic_metadata_triggers_track_rebases_and_empty_resets() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        // Rows retained from before Phase A are backfilled at generation 1.
+        insert_event(&conn, &schema, "t", 1, "{\"Chunk\":{}}", 1).unwrap();
+        insert_event(&conn, &schema, "t", 2, "{\"Chunk\":{}}", 2).unwrap();
+        install_topic_state(&conn, &schema).unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap(),
+            TopicState {
+                stream_generation: 1,
+                high_water_seq: 2
+            }
+        );
+
+        // Duplicate INSERT OR IGNORE does not fire the trigger, while a
+        // larger committed insert advances the durable high-water.
+        assert_eq!(
+            insert_event(&conn, &schema, "t", 2, "{\"other\":{}}", 3).unwrap(),
+            0
+        );
+        insert_event(&conn, &schema, "t", 3, "{\"Chunk\":{}}", 4).unwrap();
+        assert_eq!(topic_state(&conn, &schema, "t").unwrap().high_water_seq, 3);
+
+        // Low-end retention deletion does not change generation. Removing
+        // the committed high-water does, and the next stream may reuse seq 1.
+        conn.execute(
+            "DELETE FROM demo_events WHERE session_id = 't' AND seq = 1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap(),
+            TopicState {
+                stream_generation: 1,
+                high_water_seq: 3
+            }
+        );
+        conn.execute(
+            "DELETE FROM demo_events WHERE session_id = 't' AND seq = 3",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap(),
+            TopicState {
+                stream_generation: 2,
+                high_water_seq: 0
+            }
+        );
+        insert_event(&conn, &schema, "t", 1, "{\"Chunk\":{}}", 5).unwrap();
+        assert_eq!(topic_state(&conn, &schema, "t").unwrap().high_water_seq, 1);
+
+        forget_topic(&conn, &schema, "t").unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap(),
+            TopicState {
+                stream_generation: 3,
+                high_water_seq: 0
+            }
+        );
+        // Empty-topic reset is explicit because no DELETE trigger can fire.
+        forget_topic(&conn, &schema, "t").unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "t").unwrap().stream_generation,
+            4
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topic_metadata_install_rolls_back_before_trigger_commit() {
+        fn panic_before_triggers(name: &str) {
+            if name == TOPIC_INSERT_MIGRATION_CUTPOINT {
+                panic!("injected topic migration failure");
+            }
+        }
+
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        insert_event(&conn, &schema, "t", 7, "{\"Chunk\":{}}", 1).unwrap();
+        set_topic_migration_hook(Some(panic_before_triggers));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            install_topic_state(&conn, &schema).unwrap();
+        }))
+        .is_err());
+        set_topic_migration_hook(None);
+        assert!(!table_exists(&conn, schema.topic_state_table()));
+        install_topic_state(&conn, &schema).unwrap();
+        assert_eq!(topic_state(&conn, &schema, "t").unwrap().high_water_seq, 7);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topic_metadata_and_triggers_survive_post_commit_failure() {
+        fn panic_after_commit(name: &str) {
+            if name == TOPIC_COMMIT_MIGRATION_CUTPOINT {
+                panic!("injected post-commit topic migration failure");
+            }
+        }
+
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        set_topic_migration_hook(Some(panic_after_commit));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            install_topic_state(&conn, &schema).unwrap();
+        }))
+        .is_err());
+        set_topic_migration_hook(None);
+        assert!(table_exists(&conn, schema.topic_state_table()));
+        verify_topic_state_triggers(&conn, &schema).unwrap();
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 #[cfg(feature = "serve")]
 pub mod acp;
+pub mod acp_authority;
 pub mod agents;
 pub mod build_info;
 pub mod claude_settings;

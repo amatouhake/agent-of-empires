@@ -146,6 +146,7 @@ fn is_user_turn_boundary(ev: &Event) -> bool {
 /// replay semantics and `json_extract` accessors. The dependency arrow runs
 /// acp -> events.
 pub struct EventStore {
+    authority: crate::acp::authority::DbAuthority,
     conn: Mutex<Connection>,
     /// Read-only connection used exclusively by `search_content`. A
     /// content search scans many rows; routing it through the writer
@@ -170,10 +171,15 @@ impl EventStore {
     /// enabled so concurrent writers (publish path) and readers
     /// (replay endpoint) don't block each other.
     pub fn open(db_path: &Path, max_events_per_session: usize) -> Result<Self> {
+        let authority = crate::acp::authority::DbAuthority::acquire(db_path)?;
+        let db_path = authority.logical_path();
         // Prefix "acp" maps to the existing acp_events / acp_attachments
         // tables, so an established database opens unchanged (no migration).
         let schema = events::Schema::new("acp")?;
         let conn = events::open(db_path, &schema)?;
+        authority.check_path_identity()?;
+        events::install_topic_state(&conn, &schema)?;
+        authority.check_path_identity()?;
         // Separate read-only handle for content search; the writer above
         // already created the file and tables, so opening read-only here
         // always succeeds. query_only is belt-and-suspenders on top of the
@@ -197,6 +203,7 @@ impl EventStore {
             "structured view event store opened"
         );
         Ok(Self {
+            authority,
             conn: Mutex::new(conn),
             search_conn: Mutex::new(search_conn),
             schema,
@@ -211,6 +218,7 @@ impl EventStore {
     /// channel) instead of letting the on-disk log silently fall behind
     /// the in-memory broadcast subscribers.
     pub fn record(&self, session_id: &str, seq: u64, event: &Event) -> Result<()> {
+        self.authority.check_path_identity()?;
         let json = serde_json::to_string(event)
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
         let bytes = json.len();
@@ -220,7 +228,10 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let inserted = events::insert_event(&conn, &self.schema, session_id, seq, &json, now_ms)?;
+        let tx = conn
+            .unchecked_transaction()
+            .with_context(|| format!("begin event append for {session_id}@{seq}"))?;
+        let inserted = events::insert_event(&tx, &self.schema, session_id, seq, &json, now_ms)?;
         if inserted == 0 {
             // Primary-key collision: same (session_id, seq) seen before.
             // Logged at trace because the cause is usually a benign retry
@@ -253,12 +264,14 @@ impl EventStore {
         // a long session would otherwise evict them and leave the composer's
         // `/` palette and the mode picker empty on reconnect. See #1049.
         events::prune_retention(
-            &conn,
+            &tx,
             &self.schema,
             session_id,
             self.max_events_per_session,
             NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
         );
+        tx.commit()
+            .with_context(|| format!("commit event append for {session_id}@{seq}"))?;
         Ok(())
     }
 
@@ -273,12 +286,15 @@ impl EventStore {
         event: &Event,
         created_at_ms: i64,
     ) -> Result<()> {
+        self.authority.check_path_identity()?;
         let json = serde_json::to_string(event)?;
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        events::insert_event(&conn, &self.schema, session_id, seq, &json, created_at_ms)?;
+        let tx = conn.unchecked_transaction()?;
+        events::insert_event(&tx, &self.schema, session_id, seq, &json, created_at_ms)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1016,6 +1032,44 @@ impl EventStore {
         collected
     }
 
+    /// Return every persisted ACP stream state, including topics whose event
+    /// projection was explicitly reset and is currently empty.
+    pub fn all_stream_states(&self) -> Vec<(String, events::TopicState)> {
+        if let Err(e) = self.authority.check_path_identity() {
+            warn!(target: "acp.event_store", "stream-state authority check failed: {e}");
+            return Vec::new();
+        }
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        events::all_topic_states(&conn, &self.schema).unwrap_or_else(|e| {
+            warn!(target: "acp.event_store", "stream-state hydration failed: {e}");
+            Vec::new()
+        })
+    }
+
+    /// Read the current durable stream generation for a session. This is used
+    /// by the append owner to reject a stale reservation after an external
+    /// reset or an old-binary whole-topic delete.
+    pub fn stream_state(&self, session_id: &str) -> Option<events::TopicState> {
+        if let Err(e) = self.authority.check_path_identity() {
+            warn!(target: "acp.event_store", "stream-state authority check failed: {e}");
+            return None;
+        }
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match events::topic_state(&conn, &self.schema, session_id) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                warn!(target: "acp.event_store", session = %session_id, "read stream state failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Latest terminal-lifecycle event for `session_id`, used by the
     /// rate-limit park callers to detect a `Stopped{rate_limited}` and
     /// decide whether to auto-resume or hold the session parked.
@@ -1661,6 +1715,10 @@ impl EventStore {
     /// already recorded for this seq, so attachment refs never point at
     /// rows `load_attachment()` cannot serve.
     pub fn record_attachment(&self, session_id: &str, seq: u64, blob: &AttachmentBlob) -> bool {
+        if let Err(e) = self.authority.check_path_identity() {
+            warn!(target: "acp.event_store", "attachment authority check failed: {e}");
+            return false;
+        }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let conn = match self.conn.lock() {
             Ok(g) => g,
@@ -1684,6 +1742,10 @@ impl EventStore {
     /// rollback when `UserPromptSent` could not be durably persisted, so
     /// attachment refs and blobs stay in sync.
     pub fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
+        if let Err(e) = self.authority.check_path_identity() {
+            warn!(target: "acp.event_store", "attachment rollback authority check failed: {e}");
+            return;
+        }
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -1699,6 +1761,10 @@ impl EventStore {
         session_id: &str,
         attachment_id: &str,
     ) -> Option<(String, Vec<u8>)> {
+        if let Err(e) = self.authority.check_path_identity() {
+            warn!(target: "acp.event_store", "attachment read authority check failed: {e}");
+            return None;
+        }
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -1735,19 +1801,27 @@ impl EventStore {
     /// deleted or its view is switched away from structured view, so the
     /// next acp_enable starts fresh from seq=1.
     pub fn delete_session(&self, session_id: &str) {
+        if let Err(e) = self.authority.check_path_identity() {
+            warn!(target: "acp.event_store", "session reset authority check failed: {e}");
+            return;
+        }
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        // Cascades to attachment blobs so a deleted session leaves no
-        // orphaned bytes behind.
-        let deleted = events::delete_topic(&conn, &self.schema, session_id);
-        debug!(
-            target: "acp.event_store",
-            session = %session_id,
-            deleted,
-            "deleted session events"
-        );
+        match events::forget_topic(&conn, &self.schema, session_id) {
+            Ok(deleted) => debug!(
+                target: "acp.event_store",
+                session = %session_id,
+                deleted,
+                "forgot session event projection"
+            ),
+            Err(e) => warn!(
+                target: "acp.event_store",
+                session = %session_id,
+                "failed to forget session event projection: {e}"
+            ),
+        }
     }
 }
 
