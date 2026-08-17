@@ -452,6 +452,12 @@ pub struct AppState {
     /// generation and high-water seq.
     #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Keeps the test ACP database path alive for as long as its state is
+    /// alive. The authority layer intentionally rejects an unlinked logical
+    /// path, so test fixtures must retain their temporary directory instead
+    /// of relying on SQLite's open-file semantics.
+    #[cfg(all(feature = "serve", any(test, feature = "test-support")))]
+    _test_app_dir: Option<tempfile::TempDir>,
     /// Owns the per-session ACP agent subprocesses.
     #[cfg(feature = "serve")]
     pub acp_supervisor:
@@ -1233,6 +1239,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_events_tx: acp_events_tx.clone(),
         #[cfg(feature = "serve")]
         acp_event_store: acp_event_store.clone(),
+        #[cfg(all(feature = "serve", any(test, feature = "test-support")))]
+        _test_app_dir: None,
         #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
         #[cfg(feature = "serve")]
@@ -6071,6 +6079,8 @@ pub mod test_support {
             status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
             acp_events_tx,
             acp_event_store: event_store,
+            #[cfg(all(feature = "serve", any(test, feature = "test-support")))]
+            _test_app_dir: Some(app_dir),
             acp_supervisor: supervisor,
             acp_control_plane,
             plugin_host: None,
