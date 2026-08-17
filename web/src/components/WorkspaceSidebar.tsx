@@ -2078,6 +2078,7 @@ const AggregateSessionRow = memo(function AggregateSessionRow(props: SessionRowP
   return (
     <div data-testid="sidebar-session-aggregate-row" data-session-count={workspace.sessions.length}>
       <div
+        data-testid="sidebar-session-aggregate-header"
         aria-label={`${workspace.displayName}, ${workspace.sessions.length} sessions`}
         className={`flex items-center gap-2 py-2 text-text-secondary ${indented ? "pl-6 pr-3" : "px-3"}`}
       >

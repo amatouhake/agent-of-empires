@@ -238,7 +238,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page.getByRole("link", { name: /Ethiopians/i })).toBeVisible();
     await expect(page.getByRole("link", { name: /Celts/i })).toBeVisible();
 
-    await aggregate.click({ button: "right" });
+    await aggregate.getByTestId("sidebar-session-aggregate-header").click({ button: "right" });
     await expect(page.locator('[data-testid="sidebar-context-menu"]')).toHaveCount(0);
   });
 
