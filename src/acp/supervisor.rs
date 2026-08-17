@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -215,12 +215,25 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Durable stream generation used to reject a reservation that crossed a
+    /// structured-view projection reset. Non-persistent test sinks use the
+    /// initial generation.
+    fn stream_generation(&self, _session_id: &str) -> u64 {
+        1
+    }
     /// Drop all stored events for a session. Used by the import path to clear
     /// any partial replay from a prior failed attempt before re-seeding, run
     /// only after the worker slot is reserved so a duplicate spawn that hits
     /// `AlreadyRunning` can't wipe a live worker's transcript. Default no-op
     /// for test sinks without an event store. See #2276.
-    fn clear_session_events(&self, _session_id: &str) {}
+    fn clear_session_events(&self, _session_id: &str) -> bool {
+        true
+    }
+    /// Permanently remove all stored events, attachments, and stream metadata
+    /// for a session. Default is a no-op for in-memory sinks.
+    fn hard_delete_session_events(&self, _session_id: &str) -> bool {
+        true
+    }
     /// Approval nonces from `ApprovalRequested` events on disk with no
     /// matching `ApprovalResolved`. Used by `Supervisor::attach` to
     /// cancel approvals whose responder died with the previous daemon.
@@ -254,6 +267,90 @@ pub trait BroadcastSink: Send + Sync + 'static {
     /// matching `UserPromptSent` fails durability, so refs and blobs
     /// never diverge on disk.
     fn delete_attachments_for_seq(&self, _session_id: &str, _seq: u64) {}
+}
+
+struct AppendOwner<S: BroadcastSink> {
+    sink: Arc<S>,
+    next_seqs: Arc<SeqMap>,
+}
+
+impl<S: BroadcastSink> AppendOwner<S> {
+    fn new(sink: Arc<S>, next_seqs: Arc<SeqMap>) -> Self {
+        Self { sink, next_seqs }
+    }
+
+    fn publish(&self, session_id: &str, event: &Event) -> u64 {
+        let (seq, ()) = self.next_seqs.append(
+            session_id,
+            || self.sink.stream_generation(session_id),
+            |seq| self.sink.publish(session_id, seq, event),
+        );
+        seq
+    }
+
+    fn reserve(&self, session_id: &str) -> SeqReservationGuard {
+        self.next_seqs
+            .reserve(session_id, || self.sink.stream_generation(session_id))
+    }
+
+    fn commit_persisted(&self, reservation: &mut SeqReservationGuard, event: &Event) -> bool {
+        let session_id = reservation.session_id.clone();
+        let seq = reservation.seq;
+        reservation
+            .commit(
+                || self.sink.stream_generation(&session_id),
+                |seq| self.sink.publish_persisted(&session_id, seq, event),
+            )
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    seq,
+                    error = %e,
+                    "discarding stale ACP seq reservation"
+                );
+                false
+            })
+    }
+
+    fn publish_stopped_if_seq(&self, session_id: &str, reason: &str, expected_seq: u64) -> bool {
+        self.next_seqs
+            .compare_and_append(
+                session_id,
+                || self.sink.stream_generation(session_id),
+                expected_seq,
+                |seq| {
+                    self.sink.publish(
+                        session_id,
+                        seq,
+                        &Event::Stopped {
+                            reason: reason.to_string(),
+                        },
+                    );
+                },
+            )
+            .is_some()
+    }
+
+    fn hydrate(&self, streams: impl IntoIterator<Item = (String, crate::events::TopicState)>) {
+        for (session_id, state) in streams {
+            self.next_seqs
+                .hydrate(&session_id, state.stream_generation, state.high_water_seq);
+        }
+    }
+
+    fn forget(&self, session_id: &str) {
+        self.next_seqs
+            .forget(session_id, || self.sink.stream_generation(session_id));
+    }
+
+    fn hard_delete(&self, session_id: &str) -> bool {
+        let deleted = self.sink.hard_delete_session_events(session_id);
+        if deleted {
+            self.forget(session_id);
+        }
+        deleted
+    }
 }
 
 /// How this supervisor acquired the worker. Drives both reap (which
@@ -303,14 +400,222 @@ struct WorkerHandle {
     kind: WorkerKind,
 }
 
-/// Per-session monotonically-increasing seq counter. Lives at the
-/// supervisor level (not on `WorkerHandle`) so it survives shutdown
-/// and respawn cycles, and also covers the no-worker
-/// `publish_startup_error` path. Without this, both publishers
-/// would start from seq=1 and collide in the replay buffer, which
-/// the client-side `applyEvent` dedupe then turned into a silent
-/// loss of the agent's first message after a retry.
-type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
+/// Per-session append state. The state lock is also the append
+/// serialization token: a committed event cannot expose before an earlier
+/// allocated seq has finished its persistence handoff.
+struct SessionSeqState {
+    next_seq: u64,
+    generation: u64,
+    reserved: bool,
+}
+
+struct SeqSlot {
+    state: std::sync::Mutex<SessionSeqState>,
+    changed: Condvar,
+}
+
+/// Per-session seq allocator and append serialization map. It remains at the
+/// supervisor level so it survives worker shutdown and also covers synthetic
+/// no-worker events.
+struct SeqMap {
+    slots: std::sync::Mutex<HashMap<String, Arc<SeqSlot>>>,
+}
+
+impl SeqMap {
+    fn new() -> Self {
+        Self {
+            slots: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn slot(&self, session_id: &str) -> Arc<SeqSlot> {
+        let mut slots = lock_recover(&self.slots);
+        Arc::clone(slots.entry(session_id.to_string()).or_insert_with(|| {
+            Arc::new(SeqSlot {
+                state: std::sync::Mutex::new(SessionSeqState {
+                    next_seq: 0,
+                    generation: 1,
+                    reserved: false,
+                }),
+                changed: Condvar::new(),
+            })
+        }))
+    }
+
+    fn append<R, G, F>(&self, session_id: &str, generation: G, f: F) -> (u64, R)
+    where
+        G: FnOnce() -> u64,
+        F: FnOnce(u64) -> R,
+    {
+        let slot = self.slot(session_id);
+        let mut state = lock_recover(&slot.state);
+        while state.reserved {
+            state = slot
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let generation = generation();
+        if state.generation != generation {
+            state.generation = generation;
+            state.next_seq = 0;
+        }
+        state.next_seq = state.next_seq.saturating_add(1);
+        let seq = state.next_seq;
+        let result = f(seq);
+        (seq, result)
+    }
+
+    fn compare_and_append<R, G, F>(
+        &self,
+        session_id: &str,
+        generation: G,
+        expected_seq: u64,
+        f: F,
+    ) -> Option<R>
+    where
+        G: FnOnce() -> u64,
+        F: FnOnce(u64) -> R,
+    {
+        let slot = self.slot(session_id);
+        let mut state = lock_recover(&slot.state);
+        while state.reserved {
+            state = slot
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let generation = generation();
+        if state.generation != generation {
+            state.generation = generation;
+            state.next_seq = 0;
+        }
+        if state.next_seq != expected_seq {
+            return None;
+        }
+        state.next_seq = state.next_seq.saturating_add(1);
+        Some(f(state.next_seq))
+    }
+
+    fn reserve<G>(&self, session_id: &str, generation: G) -> SeqReservationGuard
+    where
+        G: FnOnce() -> u64,
+    {
+        let slot = self.slot(session_id);
+        let mut state = lock_recover(&slot.state);
+        while state.reserved {
+            state = slot
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let generation = generation();
+        if state.generation != generation {
+            state.generation = generation;
+            state.next_seq = 0;
+        }
+        state.next_seq = state.next_seq.saturating_add(1);
+        let seq = state.next_seq;
+        state.reserved = true;
+        drop(state);
+        SeqReservationGuard {
+            slot,
+            session_id: session_id.to_string(),
+            seq,
+            generation,
+            committed: false,
+        }
+    }
+
+    fn hydrate(&self, session_id: &str, generation: u64, high_water_seq: u64) {
+        let slot = self.slot(session_id);
+        let mut state = lock_recover(&slot.state);
+        while state.reserved {
+            state = slot
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if state.generation != generation {
+            state.generation = generation;
+            state.next_seq = high_water_seq;
+        } else {
+            state.next_seq = state.next_seq.max(high_water_seq);
+        }
+    }
+
+    fn forget<G>(&self, session_id: &str, generation: G)
+    where
+        G: FnOnce() -> u64,
+    {
+        let slot = self.slot(session_id);
+        let mut state = lock_recover(&slot.state);
+        while state.reserved {
+            state = slot
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.generation = generation();
+        state.next_seq = 0;
+    }
+}
+
+#[derive(Debug, Error)]
+enum SeqReservationError {
+    #[error(
+        "seq reservation for session {session_id} became stale at stream generation {generation}"
+    )]
+    StaleGeneration { session_id: String, generation: u64 },
+}
+
+/// RAII ownership of a reserved seq and the session append serialization
+/// token. Drop is synchronous and never depends on the ordinary writer queue
+/// having spare capacity.
+struct SeqReservationGuard {
+    slot: Arc<SeqSlot>,
+    session_id: String,
+    seq: u64,
+    generation: u64,
+    committed: bool,
+}
+
+impl SeqReservationGuard {
+    fn commit<R, G, F>(&mut self, current_generation: G, f: F) -> Result<R, SeqReservationError>
+    where
+        G: FnOnce() -> u64,
+        F: FnOnce(u64) -> R,
+    {
+        let mut state = lock_recover(&self.slot.state);
+        if current_generation() != self.generation {
+            state.reserved = false;
+            self.slot.changed.notify_all();
+            self.committed = true;
+            return Err(SeqReservationError::StaleGeneration {
+                session_id: self.session_id.clone(),
+                generation: self.generation,
+            });
+        }
+        let result = f(self.seq);
+        state.reserved = false;
+        self.slot.changed.notify_all();
+        self.committed = true;
+        Ok(result)
+    }
+}
+
+impl Drop for SeqReservationGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut state = lock_recover(&self.slot.state);
+        if state.reserved && state.next_seq == self.seq {
+            state.reserved = false;
+            self.slot.changed.notify_all();
+        }
+    }
+}
 
 /// Public lifecycle state for a structured view worker, surfaced via
 /// `SessionResponse.acp_worker_state` so the sidebar + structured view
@@ -355,6 +660,7 @@ pub(crate) enum ResumeReservationOutcome {
 
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
+    append_owner: Arc<AppendOwner<S>>,
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
     next_seqs: Arc<SeqMap>,
@@ -442,6 +748,136 @@ pub struct Supervisor<S: BroadcastSink> {
     /// Tests use `Supervisor::new` (effectively unbounded); production
     /// uses `Supervisor::with_capacity`.
     max_concurrent_workers: u32,
+}
+
+/// The server/plugin control boundary for ACP transport operations. Raw
+/// `Supervisor` transport methods stay private to this module; callers use
+/// this narrow capability instead of reaching through to an `AcpClient`.
+#[derive(Clone)]
+pub struct AcpControlPlane<S: BroadcastSink> {
+    supervisor: Arc<Supervisor<S>>,
+}
+
+impl<S: BroadcastSink> AcpControlPlane<S> {
+    pub fn new(supervisor: Arc<Supervisor<S>>) -> Self {
+        Self { supervisor }
+    }
+
+    pub(crate) async fn wait_until_ready(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.supervisor.wait_until_ready(session_id).await
+    }
+
+    pub(crate) async fn send_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        attachments: &[crate::acp::event_store::AttachmentBlob],
+    ) -> Result<(), SupervisorError> {
+        self.supervisor
+            .send_prompt(session_id, text, attachments)
+            .await
+    }
+
+    pub(crate) async fn reset_session_context(
+        &self,
+        session_id: &str,
+        text: &str,
+        acp_mode_id: Option<&str>,
+        yolo_mode: bool,
+    ) -> Result<(), SupervisorError> {
+        self.supervisor
+            .reset_session_context(session_id, text, acp_mode_id, yolo_mode)
+            .await
+    }
+
+    pub(crate) async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.supervisor.cancel_prompt(session_id).await
+    }
+
+    pub(crate) async fn force_end_turn(&self, session_id: &str) {
+        self.supervisor.force_end_turn(session_id).await;
+    }
+
+    pub(crate) async fn set_mode(
+        &self,
+        session_id: &str,
+        mode_id: &str,
+    ) -> Result<(), SupervisorError> {
+        self.supervisor.set_mode(session_id, mode_id).await
+    }
+
+    pub(crate) async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<(), SupervisorError> {
+        self.supervisor
+            .set_config_option(session_id, config_id, value)
+            .await
+    }
+
+    pub(crate) async fn resolve_permission(
+        &self,
+        session_id: &str,
+        nonce: Nonce,
+        decision: ApprovalDecision,
+    ) -> Result<(), SupervisorError> {
+        self.supervisor
+            .resolve_permission(session_id, nonce, decision)
+            .await
+    }
+
+    pub(crate) async fn resolve_elicitation(
+        &self,
+        session_id: &str,
+        nonce: Nonce,
+        resolution: ElicitationResolution,
+    ) -> Result<(), SupervisorError> {
+        self.supervisor
+            .resolve_elicitation(session_id, nonce, resolution)
+            .await
+    }
+
+    pub(crate) async fn publish_user_prompt_with_attachments(
+        &self,
+        session_id: &str,
+        text: String,
+        attachments: &[crate::acp::event_store::AttachmentBlob],
+    ) -> PromptDisposition {
+        self.supervisor
+            .publish_user_prompt_with_attachments(session_id, text, attachments)
+            .await
+    }
+
+    pub(crate) async fn publish_user_diff_comments_prompt(
+        &self,
+        session_id: &str,
+        intro: String,
+        outro: String,
+        is_multi_repo: bool,
+        comments: Vec<super::state::DiffComment>,
+        assembled_markdown: String,
+    ) {
+        self.supervisor
+            .publish_user_diff_comments_prompt(
+                session_id,
+                intro,
+                outro,
+                is_multi_repo,
+                comments,
+                assembled_markdown,
+            )
+            .await;
+    }
+
+    pub(crate) fn forget_session(&self, session_id: &str) {
+        self.supervisor.forget_session(session_id);
+    }
+
+    pub(crate) fn hard_delete_session(&self, session_id: &str) -> bool {
+        self.supervisor.hard_delete_session(session_id)
+    }
 }
 
 /// RAII guard: ensures a session_id is removed from `pending_resumes`
@@ -662,11 +1098,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub fn with_capacity(sink: Arc<S>, max_concurrent_workers: u32) -> Self {
+        let next_seqs = Arc::new(SeqMap::new());
         Self {
-            sink,
+            sink: Arc::clone(&sink),
+            append_owner: Arc::new(AppendOwner::new(Arc::clone(&sink), Arc::clone(&next_seqs))),
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::new(Mutex::new(HashMap::new())),
-            next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_seqs,
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_resumes: Arc::new(std::sync::Mutex::new(HashSet::new())),
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -945,12 +1383,10 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Allocate the session's next seq and publish `event` on the sink in
     /// one step. Returns the assigned seq for callers that log it or hand
-    /// it back to the API layer. Publishes that must go through
-    /// `publish_persisted` (attachment-carrying prompts) stay hand-rolled.
+    /// it back to the API layer. The append owner holds the per-session
+    /// ordering token through the sink's persistence and broadcast handoff.
     fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(session_id, seq, event);
-        seq
+        self.append_owner.publish(session_id, event)
     }
 
     /// Publish a synthetic AgentStartupError event for a session whose
@@ -965,18 +1401,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
     /// session's most recently allocated seq. Returns whether it published.
     ///
-    /// The compare and the allocation happen under one `next_seqs` guard,
-    /// which is what makes this safe: `next_seqs` is the single ordering
-    /// authority for every publisher of a session (the drain task allocates
-    /// the same way), while the SQLite log trails it by however long an
-    /// append takes. A caller that decided from the log alone and then
-    /// published unconditionally could append a turn terminator AFTER a
-    /// prompt that was allocated in the gap, terminating a brand new turn in
-    /// canonical history. Comparing against the counter instead of the log
-    /// closes that window: anything allocated since the caller's observation
-    /// moves the counter and this returns false, so the caller retries on its
-    /// next pass. The guard is released before `sink.publish`, matching every
-    /// other publisher, so a SQLite write never runs under it.
+    /// The compare, allocation, persistence, and broadcast handoff happen
+    /// under one per-session append token. A caller that decided from the log
+    /// alone and then published unconditionally could append a turn terminator
+    /// after a prompt allocated in the gap, terminating a brand new turn in
+    /// canonical history.
     ///
     /// Used by the reconciler's terminal-repair pass (#3190).
     pub fn publish_stopped_if_seq(
@@ -985,24 +1414,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
-        let seq = {
-            let mut guard = lock_recover(&self.next_seqs);
-            let current = guard.get(session_id).copied().unwrap_or(0);
-            if current != expected_seq {
-                return false;
-            }
-            let seq = current.saturating_add(1);
-            guard.insert(session_id.to_string(), seq);
-            seq
-        };
-        self.sink.publish(
-            session_id,
-            seq,
-            &Event::Stopped {
-                reason: reason.to_string(),
-            },
-        );
-        true
+        self.append_owner
+            .publish_stopped_if_seq(session_id, reason, expected_seq)
     }
 
     /// Mirror an `AcpError::IncompatibleAgent` onto the broadcast sink
@@ -1061,10 +1474,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         text: String,
         summarized_until_seq: u64,
     ) {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(
+        self.append_owner.publish(
             session_id,
-            seq,
             &Event::ConversationSummary {
                 text,
                 summarized_until_seq,
@@ -1201,7 +1612,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Adapters don't emit a structured signal for these, so detection
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
-    pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
+    #[cfg(test)]
+    async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
         self.publish_user_prompt_with_attachments(session_id, text, &[])
             .await
     }
@@ -1211,7 +1623,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// and records metadata-only refs on the event so replay can render
     /// them. The bytes never enter the event JSON; only the refs do.
     /// See #1000 / #965.
-    pub async fn publish_user_prompt_with_attachments(
+    async fn publish_user_prompt_with_attachments(
         &self,
         session_id: &str,
         text: String,
@@ -1228,7 +1640,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         } else {
             PromptDisposition::Forward
         };
-        let seq = next_seq(&self.next_seqs, session_id);
+        let mut reservation = self.append_owner.reserve(session_id);
+        let seq = reservation.seq;
         let mut refs = Vec::with_capacity(attachments.len());
         for blob in attachments {
             if !self.sink.record_attachment(session_id, seq, blob) {
@@ -1246,9 +1659,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                 size: blob.data.len() as u64,
             });
         }
-        let persisted = self.sink.publish_persisted(
-            session_id,
-            seq,
+        let persisted = self.append_owner.commit_persisted(
+            &mut reservation,
             &Event::UserPromptSent {
                 text,
                 attachments: refs,
@@ -1271,7 +1683,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// wrongly fold the transcript. The caller forwards
     /// `assembled_markdown` to the agent separately, exactly as it does
     /// the plain text of a normal prompt.
-    pub async fn publish_user_diff_comments_prompt(
+    async fn publish_user_diff_comments_prompt(
         &self,
         session_id: &str,
         intro: String,
@@ -1318,9 +1730,21 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// structured view, so the next acp_enable starts a fresh conversation
     /// from seq=1 with a clean replay buffer.
     pub fn forget_session(&self, session_id: &str) {
-        if let Ok(mut guard) = self.next_seqs.lock() {
-            guard.remove(session_id);
+        if self.sink.clear_session_events(session_id) {
+            self.append_owner.forget(session_id);
+        } else {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "session projection reset failed; preserving in-process append floor"
+            );
         }
+    }
+
+    /// Permanently remove a session's transcript and stream identity, then
+    /// reset the in-process allocator to the post-purge state.
+    pub fn hard_delete_session(&self, session_id: &str) -> bool {
+        self.append_owner.hard_delete(session_id)
     }
 
     /// Pre-populate `next_seqs` from `(session_id, max_seq)` pairs.
@@ -1328,11 +1752,18 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// event store so a fresh publish gets max_seq + 1, not 1, and
     /// doesn't collide with restored history.
     pub fn hydrate_seqs(&self, pairs: impl IntoIterator<Item = (String, u64)>) {
-        if let Ok(mut guard) = self.next_seqs.lock() {
-            for (session_id, seq) in pairs {
-                guard.insert(session_id, seq);
-            }
+        for (session_id, seq) in pairs {
+            self.next_seqs.hydrate(&session_id, 1, seq);
         }
+    }
+
+    /// Seed append state from persistent topic generations and high-water
+    /// marks before any worker or synthetic event publisher can run.
+    pub fn hydrate_streams(
+        &self,
+        streams: impl IntoIterator<Item = (String, crate::events::TopicState)>,
+    ) {
+        self.append_owner.hydrate(streams);
     }
 
     pub async fn upsert_agent(&self, name: String, spec: AgentSpec) {
@@ -1700,7 +2131,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         // duplicate import spawn that bails with AlreadyRunning can't wipe a
         // live worker's stored transcript. See #2276.
         if seed_history_replay {
-            self.sink.clear_session_events(&session_id);
+            if !self.sink.clear_session_events(&session_id) {
+                warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "import replay cleanup failed; continuing with existing transcript"
+                );
+            }
         }
 
         let acp_session_id = AcpSessionId(session_id.clone());
@@ -1828,9 +2265,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
     ) -> JoinHandle<()> {
-        let sink = Arc::clone(&self.sink);
+        let append_owner = Arc::clone(&self.append_owner);
         let workers = Arc::clone(&self.workers);
-        let next_seqs = Arc::clone(&self.next_seqs);
         let incompatible_binaries = Arc::clone(&self.incompatible_binaries);
         crate::task_util::spawn_supervised(
             "supervisor.drain",
@@ -1948,8 +2384,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             }
                             _ => {}
                         }
-                        let seq = next_seq(&next_seqs, &session_id);
-                        sink.publish(&session_id, seq, &event);
+                        append_owner.publish(&session_id, &event);
                     }
 
                     // Channel closed: the agent's connection task ended.
@@ -2097,10 +2532,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     window_secs = RESTART_WINDOW.as_secs(),
                                     "restart budget burned; parking session"
                                 );
-                                let seq = next_seq(&next_seqs, &session_id);
-                                sink.publish(
+                                append_owner.publish(
                                     &session_id,
-                                    seq,
                                     &Event::AgentStartupError {
                                         message: format!(
                                             "ACP agent crashed more than {} times in {}s; \
@@ -2138,10 +2571,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 // stop`. The reconciler will spawn a fresh
                                 // worker on its next tick if the session is
                                 // still structured_view.
-                                let seq = next_seq(&next_seqs, &session_id);
-                                sink.publish(
+                                append_owner.publish(
                                     &session_id,
-                                    seq,
                                     &Event::Stopped {
                                         reason: "user_stopped".into(),
                                     },
@@ -2275,28 +2706,22 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         session_id.clone(),
                                         respawn_config.spec.command.clone(),
                                     );
-                                    let seq = next_seq(&next_seqs, &session_id);
-                                    sink.publish(
+                                    append_owner.publish(
                                         &session_id,
-                                        seq,
                                         &Event::IncompatibleAgent {
                                             detail: payload.detail.clone(),
                                         },
                                     );
-                                    let seq = next_seq(&next_seqs, &session_id);
-                                    sink.publish(
+                                    append_owner.publish(
                                         &session_id,
-                                        seq,
                                         &Event::AgentStartupError {
                                             message: payload.message.clone(),
                                         },
                                     );
                                     terminate_runner_for_session(&session_id);
                                 } else {
-                                    let seq = next_seq(&next_seqs, &session_id);
-                                    sink.publish(
+                                    append_owner.publish(
                                         &session_id,
-                                        seq,
                                         &Event::AgentStartupError {
                                             message: format!("ACP agent respawn failed: {e}"),
                                         },
@@ -2327,10 +2752,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 session = %session_id,
                                 "respawned client missing inbound receiver; parking",
                             );
-                            let seq = next_seq(&next_seqs, &session_id);
-                            sink.publish(
+                            append_owner.publish(
                                 &session_id,
-                                seq,
                                 &Event::AgentStartupError {
                                     message: "respawned ACP client had no inbound channel".into(),
                                 },
@@ -2441,13 +2864,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// discovering the worker never arrived is what leaves a session
     /// rendering "running" forever with no agent behind it (#3172). Costs a
     /// single worker-map lookup when the worker is already live.
-    pub async fn wait_until_ready(&self, session_id: &str) -> Result<(), SupervisorError> {
+    async fn wait_until_ready(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.ready_client(session_id).await.map(|_| ())
     }
 
     /// Send a user prompt (with optional attachments) to a running
     /// structured view worker.
-    pub async fn send_prompt(
+    async fn send_prompt(
         &self,
         session_id: &str,
         text: &str,
@@ -2482,7 +2905,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// refusal's `PromptRejected`); `acp_mode_id` / `yolo_mode` are the
     /// caller's persisted `Instance` values, exactly as a `SpawnRequest`
     /// would carry them.
-    pub async fn reset_session_context(
+    async fn reset_session_context(
         &self,
         session_id: &str,
         text: &str,
@@ -2529,7 +2952,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Cancel the current turn for a running structured view worker. Best-effort:
     /// returns Ok if the worker exists even when no turn is in flight.
-    pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
+    async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.cancel_prompt().await?;
         Ok(())
@@ -2549,7 +2972,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Both are best-effort and idempotent: the synthetic `Stopped` bypasses
     /// the drain (so it never triggers a restart on its own), and a second
     /// `Stopped` is a capped no-op for the reducer. See #1727 / #1100.
-    pub async fn force_end_turn(&self, session_id: &str) {
+    async fn force_end_turn(&self, session_id: &str) {
         if let Ok(client) = self.client_for_session(session_id).await {
             let _ = client.force_cancel().await;
         }
@@ -2562,7 +2985,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Set the active session mode through the adapter's advertised mode channel.
-    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), SupervisorError> {
+    async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.set_mode(mode_id).await?;
         Ok(())
@@ -2570,7 +2993,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Set a per-session selector via ACP session/set_config_option.
     /// Delegates to the per-session AcpClient. See #1403.
-    pub async fn set_config_option(
+    async fn set_config_option(
         &self,
         session_id: &str,
         config_id: &str,
@@ -2582,7 +3005,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Resolve a pending approval.
-    pub async fn resolve_permission(
+    async fn resolve_permission(
         &self,
         session_id: &str,
         nonce: Nonce,
@@ -2595,7 +3018,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Resolve a pending `AskUserQuestion` elicitation by nonce, unblocking
     /// the parked `elicitation/create` callback with the user's answer.
-    pub async fn resolve_elicitation(
+    async fn resolve_elicitation(
         &self,
         session_id: &str,
         nonce: Nonce,
@@ -3345,20 +3768,12 @@ async fn restart_decision(
     }
 }
 
-/// Increment and return the per-session seq counter. Lives at the
-/// supervisor level so the no-worker `publish_startup_error` path
-/// and the drain task share a single source of truth — otherwise
-/// both used to start at seq=1 and collide in the replay buffer
-/// after a retry, which the client-side dedupe then rendered as a
-/// silently-lost first message.
+/// Compatibility helper for tests that exercise the supervisor's raw
+/// per-session counter. Production event publication goes through
+/// `AppendOwner`, which keeps this allocation and the sink handoff ordered.
+#[cfg(test)]
 fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
-    let mut guard = match next_seqs.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let entry = guard.entry(session_id.to_string()).or_insert(0);
-    *entry = entry.saturating_add(1);
-    *entry
+    next_seqs.append(session_id, || 1, |_| ()).0
 }
 
 /// Take a `std::sync::Mutex` guard, recovering the inner data if
@@ -3414,8 +3829,24 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
-    fn clear_session_events(&self, session_id: &str) {
-        self.event_store.delete_session(session_id);
+    fn clear_session_events(&self, session_id: &str) -> bool {
+        self.event_store.delete_session(session_id)
+    }
+
+    fn hard_delete_session_events(&self, session_id: &str) -> bool {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.event_store.hard_delete_session(session_id).is_ok()
+            }),
+            _ => self.event_store.hard_delete_session(session_id).is_ok(),
+        }
+    }
+
+    fn stream_generation(&self, session_id: &str) -> u64 {
+        self.event_store
+            .stream_state(session_id)
+            .map(|state| state.stream_generation)
+            .unwrap_or(1)
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
@@ -3691,6 +4122,206 @@ mod tests {
         fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_elicitation_nonces.lock().unwrap().clone()
         }
+    }
+
+    /// A sink that holds the first append inside its persistence/exposure
+    /// callback. The second caller must not reach the sink until the first
+    /// callback completes, which makes the former allocation-versus-write
+    /// inversion opportunity deterministic.
+    struct BlockingSink {
+        frames: std::sync::Mutex<Vec<u64>>,
+        first_entered: (std::sync::Mutex<bool>, Condvar),
+        release_first: (std::sync::Mutex<bool>, Condvar),
+    }
+
+    impl BlockingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                frames: std::sync::Mutex::new(Vec::new()),
+                first_entered: (std::sync::Mutex::new(false), Condvar::new()),
+                release_first: (std::sync::Mutex::new(false), Condvar::new()),
+            })
+        }
+
+        fn wait_for_first(&self) {
+            let (entered, changed) = &self.first_entered;
+            let mut entered = entered.lock().unwrap();
+            while !*entered {
+                entered = changed.wait(entered).unwrap();
+            }
+        }
+
+        fn release_first(&self) {
+            let (released, changed) = &self.release_first;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+    }
+
+    impl BroadcastSink for BlockingSink {
+        fn publish(&self, _session_id: &str, seq: u64, _event: &Event) {
+            if seq == 1 {
+                let (entered, changed) = &self.first_entered;
+                *entered.lock().unwrap() = true;
+                changed.notify_all();
+
+                let (released, changed) = &self.release_first;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            self.frames.lock().unwrap().push(seq);
+        }
+    }
+
+    struct AttachmentFailSink {
+        frames: std::sync::Mutex<Vec<(String, u64, Event)>>,
+        written: std::sync::Mutex<Vec<String>>,
+        deleted: std::sync::Mutex<Vec<(String, u64)>>,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl AttachmentFailSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                frames: std::sync::Mutex::new(Vec::new()),
+                written: std::sync::Mutex::new(Vec::new()),
+                deleted: std::sync::Mutex::new(Vec::new()),
+                calls: std::sync::Mutex::new(0),
+            })
+        }
+    }
+
+    impl BroadcastSink for AttachmentFailSink {
+        fn publish(&self, session_id: &str, seq: u64, event: &Event) {
+            self.frames
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), seq, event.clone()));
+        }
+
+        fn record_attachment(
+            &self,
+            _session_id: &str,
+            _seq: u64,
+            blob: &crate::acp::event_store::AttachmentBlob,
+        ) -> bool {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                self.written.lock().unwrap().push(blob.id.clone());
+                true
+            } else {
+                false
+            }
+        }
+
+        fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
+            self.deleted
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), seq));
+            self.written.lock().unwrap().clear();
+        }
+    }
+
+    #[test]
+    fn append_owner_serializes_numeric_commit_and_exposure_order() {
+        let sink = BlockingSink::new();
+        let owner = Arc::new(AppendOwner::new(Arc::clone(&sink), Arc::new(SeqMap::new())));
+        let first_owner = Arc::clone(&owner);
+        let first = std::thread::spawn(move || {
+            first_owner.publish("s-ordered", &Event::ThinkingStarted);
+        });
+        sink.wait_for_first();
+
+        let second_started = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = second_started;
+        let second_owner = Arc::clone(&owner);
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            second_owner.publish("s-ordered", &Event::ThinkingStarted);
+        });
+        started_rx.recv().unwrap();
+        assert!(sink.frames.lock().unwrap().is_empty());
+
+        sink.release_first();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(sink.frames.lock().unwrap().as_slice(), &[1, 2]);
+    }
+
+    #[test]
+    fn seq_reservation_abandonment_releases_without_writer_queue_capacity() {
+        let seqs = Arc::new(SeqMap::new());
+        let reservation = seqs.reserve("s-reservation", || 1);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let seqs_for_thread = Arc::clone(&seqs);
+        let append = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(seqs_for_thread.append("s-reservation", || 1, |_| ()).0)
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        drop(reservation);
+        assert_eq!(result_rx.recv().unwrap(), 2);
+        append.join().unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reservation = seqs.reserve("s-panic", || 1);
+            panic!("abandon reservation");
+        }));
+        assert!(result.is_err());
+        assert_eq!(seqs.append("s-panic", || 1, |_| ()).0, 2);
+    }
+
+    #[test]
+    fn stale_seq_reservation_cannot_commit_after_generation_change() {
+        let seqs = SeqMap::new();
+        let mut reservation = seqs.reserve("s-stale", || 1);
+        let committed = reservation.commit(|| 2, |_| true);
+        assert!(matches!(
+            committed,
+            Err(SeqReservationError::StaleGeneration { .. })
+        ));
+        assert_eq!(seqs.append("s-stale", || 2, |_| ()).0, 1);
+    }
+
+    #[tokio::test]
+    async fn attachment_failure_cleans_siblings_without_rejecting_prompt_forwarding() {
+        let sink = AttachmentFailSink::new();
+        let sup = Supervisor::new(Arc::clone(&sink));
+        let blobs = [
+            crate::acp::event_store::AttachmentBlob {
+                id: "first".into(),
+                kind: crate::acp::state::PromptAttachmentKind::Resource,
+                mime_type: "text/plain".into(),
+                name: None,
+                data: b"one".to_vec(),
+            },
+            crate::acp::event_store::AttachmentBlob {
+                id: "second".into(),
+                kind: crate::acp::state::PromptAttachmentKind::Resource,
+                mime_type: "text/plain".into(),
+                name: None,
+                data: b"two".to_vec(),
+            },
+        ];
+
+        let disposition = sup
+            .publish_user_prompt_with_attachments("s-attachments", "prompt".into(), &blobs)
+            .await;
+        assert_eq!(disposition, PromptDisposition::Forward);
+        assert!(sink.frames.lock().unwrap().is_empty());
+        assert!(sink.written.lock().unwrap().is_empty());
+        assert_eq!(
+            sink.deleted.lock().unwrap().as_slice(),
+            &[("s-attachments".to_string(), 1)]
+        );
+        assert_eq!(next_seq(&sup.next_seqs, "s-attachments"), 2);
     }
 
     /// #3241: the allowlist gates both resolution branches, and a refusal is
@@ -5241,6 +5872,38 @@ cursor-acp-bridge = "agent acp"
         assert!(matches!(&frames[0].2, Event::UserPromptSent { .. }));
     }
 
+    #[tokio::test]
+    async fn diff_comments_keep_typed_transcript_and_skip_clear_interpretation() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.publish_user_diff_comments_prompt(
+            "s-diff",
+            "Please review".into(),
+            "Thanks".into(),
+            false,
+            Vec::new(),
+            "Please review `src/lib.rs`".into(),
+        )
+        .await;
+
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0].2,
+            Event::UserDiffCommentsPrompt {
+                intro,
+                outro,
+                assembled_markdown,
+                ..
+            } if intro == "Please review"
+                && outro == "Thanks"
+                && assembled_markdown == "Please review `src/lib.rs`"
+        ));
+        assert!(!frames
+            .iter()
+            .any(|(_, _, event)| matches!(event, Event::SessionCleared)));
+    }
+
     /// #2979: `reset_session_context` must route a `ResetSession` command
     /// to the worker's client, never a `Prompt`, and re-assert an
     /// explicitly persisted session mode afterwards so the fresh ACP
@@ -6186,6 +6849,47 @@ cursor-acp-bridge = "agent acp"
         ));
     }
 
+    /// A failed durable append still exposes the typed fallback at its
+    /// allocated seq, but that seq is not durable high-water. The same
+    /// process keeps the allocation floor, so recovery uses a strictly larger
+    /// seq and cannot be hidden by a live consumer that saw the fallback.
+    #[tokio::test]
+    async fn failed_event_append_keeps_allocation_floor_above_durable_high_water() {
+        use crate::acp::event_store::EventStore;
+        use tempfile::TempDir;
+        use tokio::sync::broadcast;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("acp.db");
+        let event_store = Arc::new(EventStore::open(&db_path, 1000).unwrap());
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: event_store.clone(),
+        });
+        let sup = Supervisor::new(sink);
+
+        let displaced = tmp.path().join("displaced.db");
+        std::fs::rename(&db_path, &displaced).unwrap();
+        std::fs::write(&db_path, b"replacement").unwrap();
+        sup.publish_startup_error("s-failure", "first".into());
+        let fallback = rx.try_recv().unwrap();
+        assert_eq!(fallback.seq, 1);
+        assert!(matches!(
+            fallback.event.as_ref(),
+            Event::AgentStartupError { .. }
+        ));
+        assert_eq!(event_store.highest_seq("s-failure"), 0);
+
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::rename(&displaced, &db_path).unwrap();
+        sup.publish_startup_error("s-failure", "second".into());
+        let recovered = rx.try_recv().unwrap();
+        assert_eq!(recovered.seq, 2);
+        assert_eq!(event_store.highest_seq("s-failure"), 2);
+        assert_eq!(event_store.replay_from("s-failure", 0).len(), 1);
+    }
+
     /// #3152: the retry of a rate-limited session runs in a fresh worker
     /// whose capture map is empty, so a rejection with no reset of its own
     /// inherits the reset already recorded for the session. Publishing is
@@ -6268,7 +6972,7 @@ cursor-acp-bridge = "agent acp"
             event_store: event_store.clone(),
         });
         let sup = Supervisor::new(sink);
-        sup.hydrate_seqs(event_store.all_session_seqs());
+        sup.hydrate_streams(event_store.all_stream_states());
         sup.publish_user_prompt("s-99", "after restart".into())
             .await;
 
@@ -6288,6 +6992,56 @@ cursor-acp-bridge = "agent acp"
             })
             .collect();
         assert_eq!(texts, vec!["first", "second", "third", "after restart"]);
+    }
+
+    #[tokio::test]
+    async fn supervisor_resets_allocator_after_persisted_projection_forget() {
+        use crate::acp::event_store::EventStore;
+        use tempfile::TempDir;
+        use tokio::sync::broadcast;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("acp.db");
+        {
+            let event_store = Arc::new(EventStore::open(&db_path, 1000).unwrap());
+            let (tx, _rx) = broadcast::channel(16);
+            let sink = Arc::new(ChannelSink {
+                tx,
+                event_store: event_store.clone(),
+            });
+            let sup = Supervisor::new(sink);
+            sup.publish_user_prompt("s-reset-generation", "before".into())
+                .await;
+            sup.forget_session("s-reset-generation");
+            assert_eq!(
+                event_store
+                    .stream_state("s-reset-generation")
+                    .unwrap()
+                    .stream_generation,
+                2
+            );
+        }
+
+        let event_store = Arc::new(EventStore::open(&db_path, 1000).unwrap());
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: event_store.clone(),
+        });
+        let sup = Supervisor::new(sink);
+        sup.hydrate_streams(event_store.all_stream_states());
+        sup.publish_user_prompt("s-reset-generation", "after".into())
+            .await;
+
+        assert_eq!(rx.try_recv().unwrap().seq, 1);
+        assert_eq!(event_store.highest_seq("s-reset-generation"), 1);
+        assert_eq!(
+            event_store
+                .stream_state("s-reset-generation")
+                .unwrap()
+                .stream_generation,
+            2
+        );
     }
 
     /// `worker_state` returns Resuming while an entry sits in

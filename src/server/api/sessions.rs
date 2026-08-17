@@ -3961,8 +3961,13 @@ async fn purge_session_artifacts(
                             );
                         }
                     }
-                    state.acp_supervisor.forget_session(id);
-                    state.acp_event_store.delete_session(id);
+                    if !state.acp_control_plane.hard_delete_session(id) {
+                        tracing::warn!(
+                            target: "acp.event_store",
+                            session = %id,
+                            "hard deletion of ACP transcript failed after session removal"
+                        );
+                    }
                 }
 
                 tokio::task::spawn_blocking(move || committed.finish())

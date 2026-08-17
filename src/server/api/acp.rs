@@ -1393,7 +1393,7 @@ pub async fn acp_prompt_diff_comments(
     // on-disk store captures the user's side even if the forward fails,
     // matching acp_prompt.
     state
-        .acp_supervisor
+        .acp_control_plane
         .publish_user_diff_comments_prompt(
             &id,
             req.intro,
@@ -1404,7 +1404,7 @@ pub async fn acp_prompt_diff_comments(
         )
         .await;
     match state
-        .acp_supervisor
+        .acp_control_plane
         .send_prompt(&id, &req.assembled_markdown, &[])
         .await
     {
@@ -1452,17 +1452,17 @@ pub async fn acp_cancel(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    match state.acp_supervisor.cancel_prompt(&id).await {
+    match state.acp_control_plane.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(e) => supervisor_error_response("cancel failed", &e),
     }
 }
 
 /// Escape hatch for the "stuck spinner" failure mode (#1100). Publishes
-/// a synthetic `Stopped { reason: "user_forced" }` so every connected UI
-/// drops `turnActive`, then best-effort cancels any in-flight agent
-/// turn. Always 202: the publish is idempotent and the cancel is
-/// fire-and-forget; any genuine read-only mode is rejected upstream.
+/// best-effort cancels any in-flight agent turn, then publishes a synthetic
+/// `Stopped { reason: "user_forced" }` so every connected UI drops
+/// `turnActive`. Always 202: both operations are best-effort and any genuine
+/// read-only mode is rejected upstream.
 pub async fn acp_force_end_turn(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1470,7 +1470,7 @@ pub async fn acp_force_end_turn(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    state.acp_supervisor.force_end_turn(&id).await;
+    state.acp_control_plane.force_end_turn(&id).await;
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -2106,12 +2106,11 @@ pub async fn acp_disable(
     // Without this, the next acp_enable's first event would
     // collide on a stale seq with the buffer entry from this
     // conversation, and the client-side dedupe would silently eat it.
-    state.acp_supervisor.forget_session(&id);
     // Drop the structured-view event projection either way: on keep-context,
     // the terminal `claude --resume` reprints the conversation itself, so the
     // tmux pane does not need the AoE event replay, and terminal turns would
     // otherwise leave it stale. See #2252.
-    state.acp_event_store.delete_session(&id);
+    state.acp_control_plane.forget_session(&id);
     if keep_context {
         tracing::debug!(
             target: "acp.switch",
@@ -2244,7 +2243,7 @@ pub async fn acp_set_mode(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    match state.acp_supervisor.set_mode(&id, &req.mode_id).await {
+    match state.acp_control_plane.set_mode(&id, &req.mode_id).await {
         Ok(()) => {
             // The agent accepted the mode switch; tally plan-mode adoption for
             // the opt-in telemetry snapshot. Other modes are out of scope for now.
@@ -2401,7 +2400,7 @@ pub async fn acp_set_config_option(
         Err(rej) => return rej.into_response(),
     };
     match state
-        .acp_supervisor
+        .acp_control_plane
         .set_config_option(&id, &req.config_id, &req.value)
         .await
     {
@@ -2479,7 +2478,7 @@ pub async fn resolve_approval(
     let nonce = Nonce(nonce_str.clone());
     let decision = req.decision;
     match state
-        .acp_supervisor
+        .acp_control_plane
         .resolve_permission(&id, nonce, decision.into())
         .await
     {
@@ -2521,7 +2520,7 @@ pub async fn resolve_elicitation(
     };
     let nonce = Nonce(nonce_str.clone());
     match state
-        .acp_supervisor
+        .acp_control_plane
         .resolve_elicitation(&id, nonce, resolution)
         .await
     {

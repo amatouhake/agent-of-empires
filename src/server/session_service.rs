@@ -90,6 +90,11 @@ pub struct SessionService {
     #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    /// Narrow ACP transport capability used by turn delivery and plugin
+    /// callers. Raw transport methods on `Supervisor` are module-private.
+    #[cfg(feature = "serve")]
+    pub acp_control_plane:
+        Arc<crate::acp::supervisor::AcpControlPlane<crate::acp::supervisor::ChannelSink>>,
     /// Durable ACP event store, shared with `AppState.acp_event_store`. Used
     /// by the pending-turn drain to reload attachment blobs for a rate-limit
     /// resume continuation (#3028).
@@ -175,6 +180,9 @@ impl SessionService {
         acp_supervisor: Arc<
             crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
         >,
+        acp_control_plane: Arc<
+            crate::acp::supervisor::AcpControlPlane<crate::acp::supervisor::ChannelSink>,
+        >,
         acp_event_store: Arc<crate::acp::event_store::EventStore>,
     ) -> Self {
         Self {
@@ -183,6 +191,7 @@ impl SessionService {
             file_watch,
             telemetry_session_creates,
             acp_supervisor,
+            acp_control_plane,
             acp_event_store,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -437,7 +446,7 @@ impl SessionService {
         // true for a resume another caller already reserved, so a false
         // `needs_resume` does not imply a live worker. For one that is live
         // this is a single worker-map lookup.
-        if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
+        if let Err(e) = self.acp_control_plane.wait_until_ready(id).await {
             return match e {
                 crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
                     Err(SendTurnError::WorkerNotReady)
@@ -453,7 +462,7 @@ impl SessionService {
         // already re-asserts the mode on every (re)spawn.
         if matches!(caller, SessionCaller::Plugin { .. }) {
             if let Some(mode_id) = &acp_mode_id {
-                if let Err(e) = self.acp_supervisor.set_mode(id, mode_id).await {
+                if let Err(e) = self.acp_control_plane.set_mode(id, mode_id).await {
                     return Err(SendTurnError::ModeApplication(e));
                 }
             }
@@ -472,15 +481,17 @@ impl SessionService {
         // `/clear` resets the context but leaves the new conversation
         // unresumable across a worker restart (upstream #906).
         let disposition = self
-            .acp_supervisor
+            .acp_control_plane
             .publish_user_prompt_with_attachments(id, text.to_string(), attachments)
             .await;
         let outcome = match disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
-                self.acp_supervisor.send_prompt(id, text, attachments).await
+                self.acp_control_plane
+                    .send_prompt(id, text, attachments)
+                    .await
             }
             crate::acp::supervisor::PromptDisposition::ResetContext => {
-                self.acp_supervisor
+                self.acp_control_plane
                     .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
                     .await
             }

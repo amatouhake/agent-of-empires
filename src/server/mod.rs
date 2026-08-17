@@ -447,15 +447,21 @@ pub struct AppState {
     /// Disk-backed acp event log. The single source of truth for
     /// replay: `ChannelSink::publish` writes here on every event, the
     /// WS-on-connect drain reads from here, the `/acp/replay` REST
-    /// endpoint reads from here, and `Supervisor::next_seqs` is seeded
-    /// from here at startup so a fresh publish gets `max_seq + 1`
-    /// rather than 1.
+    /// endpoint reads from here, and the supervisor's append state is seeded
+    /// from here at startup so a fresh publish resumes the persisted
+    /// generation and high-water seq.
     #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// Owns the per-session ACP agent subprocesses.
     #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    /// Narrow ACP transport capability for server and plugin turn/control
+    /// callers. Raw transport methods remain private to the supervisor
+    /// module.
+    #[cfg(feature = "serve")]
+    pub acp_control_plane:
+        Arc<crate::acp::supervisor::AcpControlPlane<crate::acp::supervisor::ChannelSink>>,
     /// The Tier 1 plugin worker host. `None` in test harnesses that do not
     /// stand up a host; `Some` in a live daemon.
     #[cfg(feature = "serve")]
@@ -880,14 +886,16 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             sink,
             config.acp.max_concurrent_workers,
         ));
-        // Seed the seq counter from disk so fresh publishes don't
-        // collide with restored history. Without this, after a
-        // restart the first publish would be seq=1 — duplicate of
-        // the row already on disk — and INSERT OR IGNORE would
-        // silently drop it.
-        supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
+        // Seed append state from disk so fresh publishes resume the
+        // persisted generation and high-water mark. Without this, after
+        // a restart the first publish could collide with restored history.
+        supervisor.hydrate_streams(acp_event_store.all_stream_states());
         supervisor
     };
+    #[cfg(feature = "serve")]
+    let acp_control_plane = std::sync::Arc::new(crate::acp::supervisor::AcpControlPlane::new(
+        acp_supervisor.clone(),
+    ));
     // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
     // the worker log dir) is cheap and side-effect-free until workers launch,
     // which happens after the daemon is up. A failure here is logged, not fatal:
@@ -904,6 +912,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
         acp_supervisor.clone(),
+        acp_control_plane.clone(),
         acp_event_store.clone(),
     ));
     #[cfg(not(feature = "serve"))]
@@ -1226,6 +1235,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_event_store: acp_event_store.clone(),
         #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
+        #[cfg(feature = "serve")]
+        acp_control_plane: acp_control_plane.clone(),
         #[cfg(feature = "serve")]
         plugin_host: plugin_host.clone(),
         plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
@@ -6006,6 +6017,9 @@ pub mod test_support {
         });
         let supervisor =
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
+        let acp_control_plane = std::sync::Arc::new(crate::acp::supervisor::AcpControlPlane::new(
+            supervisor.clone(),
+        ));
         let instances = Arc::new(RwLock::new(prior));
         let instance_locks = Arc::new(RwLock::new(HashMap::new()));
         let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
@@ -6017,6 +6031,7 @@ pub mod test_support {
             Arc::clone(&file_watch),
             Arc::clone(&telemetry_session_creates),
             supervisor.clone(),
+            acp_control_plane.clone(),
             event_store.clone(),
         ));
         Arc::new(AppState {
@@ -6057,6 +6072,7 @@ pub mod test_support {
             acp_events_tx,
             acp_event_store: event_store,
             acp_supervisor: supervisor,
+            acp_control_plane,
             plugin_host: None,
             plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
             push: None,

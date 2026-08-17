@@ -46,6 +46,10 @@ jobs:
             printf '%s\n' "$unexpected"
             exit 1
           fi
+      - name: ACP transport boundary inventory
+        run: |
+          bash scripts/check-acp-boundary.sh --self-test
+          bash scripts/check-acp-boundary.sh
 
   web-fmt:
     name: Format (web)
