@@ -90,12 +90,11 @@ impl DbAuthority {
         let opened_identity = file_identity(&opened_file)
             .with_context(|| format!("identify ACP database {}", logical_path.display()))?;
 
-        let identity_lock_path = logical_path.with_file_name(format!(
-            ".{}.identity.{}.lock",
-            logical_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("acp-events"),
+        // Keep identity locks in one deterministic namespace rather than
+        // beside the logical path. Hardlink aliases can live in different
+        // directories, so a sidecar next to each alias would not converge.
+        let identity_lock_path = std::env::temp_dir().join(format!(
+            ".aoe-acp-identity.{}.lock",
             safe_identity_name(&opened_identity)
         ));
         let identity_lease = OpenOptions::new()
@@ -194,11 +193,13 @@ fn file_identity_from_metadata(metadata: &fs::Metadata) -> Result<String> {
 #[cfg(windows)]
 fn file_identity_from_metadata(metadata: &fs::Metadata) -> Result<String> {
     use std::os::windows::fs::MetadataExt;
-    Ok(format!(
-        "{}:{}",
-        metadata.volume_serial_number().unwrap_or(0),
-        metadata.file_index().unwrap_or(0)
-    ))
+    let volume = metadata
+        .volume_serial_number()
+        .ok_or_else(|| anyhow::anyhow!("ACP database volume identity is unavailable"))?;
+    let index = metadata
+        .file_index()
+        .ok_or_else(|| anyhow::anyhow!("ACP database file identity is unavailable"))?;
+    Ok(format!("{}:{}", volume, index))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -236,5 +237,51 @@ mod tests {
         fs::write(&replacement, b"replacement").unwrap();
         fs::rename(&replacement, &path).unwrap();
         assert!(authority.check_path_identity().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_aliases_share_the_opened_identity_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acp_events.db");
+        let alias_dir = dir.path().join("alias");
+        fs::create_dir(&alias_dir).unwrap();
+        let alias = alias_dir.join("acp_events.db");
+        let authority = DbAuthority::acquire(&path).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        assert!(DbAuthority::acquire(&alias).is_err());
+        drop(authority);
+        assert!(DbAuthority::acquire(&alias).is_ok());
+    }
+
+    #[test]
+    fn first_create_race_allows_only_one_live_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acp_events.db");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let finish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let start = std::sync::Arc::clone(&start);
+                let finish = std::sync::Arc::clone(&finish);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let authority = DbAuthority::acquire(&path);
+                    let acquired = authority.is_ok();
+                    // Keep the successful lease live until both contenders
+                    // have crossed the acquisition point.
+                    finish.wait();
+                    drop(authority);
+                    acquired
+                })
+            })
+            .collect::<Vec<_>>();
+        let acquired = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|acquired| *acquired)
+            .count();
+        assert_eq!(acquired, 1);
     }
 }

@@ -312,8 +312,10 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE acp_events (session_id TEXT, seq INTEGER, event_json TEXT);
              CREATE TABLE acp_attachments (session_id TEXT, attachment_id TEXT, data BLOB);
+             CREATE TABLE acp_event_topics (session_id TEXT PRIMARY KEY, stream_generation INTEGER, high_water_seq INTEGER);
              INSERT INTO acp_events VALUES ('keep', 0, '{}'), ('drop', 0, '{}'), ('drop', 1, '{}');
-             INSERT INTO acp_attachments VALUES ('keep', 'a0', x'00'), ('drop', 'a1', x'01');",
+             INSERT INTO acp_attachments VALUES ('keep', 'a0', x'00'), ('drop', 'a1', x'01');
+             INSERT INTO acp_event_topics VALUES ('keep', 1, 0), ('drop', 3, 2);",
         )
         .unwrap();
         drop(conn);
@@ -342,8 +344,16 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        let topic_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_event_topics WHERE session_id = 'drop'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(events, 0, "target event rows should be deleted");
         assert_eq!(attachments, 0, "target attachment blobs should be deleted");
+        assert_eq!(topic_rows, 0, "target topic metadata must be deleted");
         assert_eq!(kept_events, 1, "other session must be untouched");
     }
 
@@ -356,5 +366,38 @@ mod tests {
         // Open creates an empty db with neither acp_events nor acp_attachments.
         rusqlite::Connection::open(&db_path).unwrap();
         purge_acp_transcript_rows(&db_path, "whatever").unwrap();
+    }
+
+    #[test]
+    fn purge_acp_transcript_rows_rolls_back_when_a_table_delete_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("acp_events.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE acp_events (session_id TEXT, seq INTEGER, event_json TEXT);
+             CREATE TABLE acp_attachments (session_id TEXT, attachment_id TEXT, data BLOB);
+             CREATE TABLE acp_event_topics (session_id TEXT PRIMARY KEY, stream_generation INTEGER, high_water_seq INTEGER);
+             INSERT INTO acp_events VALUES ('drop', 1, '{}');
+             INSERT INTO acp_attachments VALUES ('drop', 'a1', x'01');
+             INSERT INTO acp_event_topics VALUES ('drop', 2, 1);
+             CREATE TRIGGER deny_attachment_purge
+             BEFORE DELETE ON acp_attachments
+             BEGIN SELECT RAISE(ABORT, 'injected purge failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(purge_acp_transcript_rows(&db_path, "drop").is_err());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for table in ["acp_events", "acp_attachments", "acp_event_topics"] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = 'drop'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} must remain after a failed purge");
+        }
     }
 }

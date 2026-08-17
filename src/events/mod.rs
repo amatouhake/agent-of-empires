@@ -25,7 +25,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
 use tracing::{debug, warn};
 
 /// Names the two tables an [`EventLog`-style consumer](self) reads and
@@ -175,8 +175,7 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
 pub fn install_topic_state(conn: &Connection, schema: &Schema) -> Result<()> {
     let events = schema.events_table();
     let topics = schema.topic_state_table();
-    let tx = conn
-        .unchecked_transaction()
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin event topic metadata migration")?;
     tx.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {topics} (
@@ -1198,6 +1197,68 @@ mod tests {
         verify_topic_state_triggers(&conn, &schema).unwrap();
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn retention_prune_preserves_generation_and_high_water() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        install_topic_state(&conn, &schema).unwrap();
+        for seq in 1..=4u64 {
+            insert_event(
+                &conn,
+                &schema,
+                "retained",
+                seq,
+                "{\"Chunk\":{}}",
+                seq as i64,
+            )
+            .unwrap();
+        }
+        prune_retention(&conn, &schema, "retained", 2, &[]);
+        assert_eq!(
+            topic_state(&conn, &schema, "retained").unwrap(),
+            TopicState {
+                stream_generation: 1,
+                high_water_seq: 4,
+            }
+        );
+        assert_eq!(lowest_seq(&conn, &schema, "retained"), Some(3));
+        insert_event(&conn, &schema, "retained", 5, "{\"Chunk\":{}}", 5).unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "retained")
+                .unwrap()
+                .high_water_seq,
+            5
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hard_delete_removes_topic_identity_with_attachments() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        install_topic_state(&conn, &schema).unwrap();
+        insert_event(&conn, &schema, "purge", 1, "{\"Chunk\":{}}", 1).unwrap();
+        insert_attachment(
+            &conn,
+            &schema,
+            "purge",
+            1,
+            "attachment",
+            "image",
+            "image/png",
+            None,
+            b"bytes",
+            1,
+        );
+        assert_eq!(hard_delete_topic(&conn, &schema, "purge").unwrap(), 1);
+        assert!(load_attachment(&conn, &schema, "purge", "attachment").is_none());
+        assert!(all_topic_states(&conn, &schema)
+            .unwrap()
+            .iter()
+            .all(|(topic, _)| topic != "purge"));
+    }
+
     fn table_exists(conn: &Connection, table: &str) -> bool {
         conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1271,6 +1332,33 @@ mod tests {
         assert!(
             load_attachment(&conn, &schema, "t", "pruned-att").is_none(),
             "blob owned by a pruned event must be dropped"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn topic_metadata_reupgrade_preserves_generation_and_raises_high_water() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        insert_event(&conn, &schema, "reupgrade", 1, "{\"Chunk\":{}}", 1).unwrap();
+        install_topic_state(&conn, &schema).unwrap();
+        conn.execute(
+            "UPDATE demo_event_topics SET stream_generation = 7, high_water_seq = 1 WHERE session_id = 'reupgrade'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER demo_events_topic_insert; DROP TRIGGER demo_events_topic_delete;",
+        )
+        .unwrap();
+        insert_event(&conn, &schema, "reupgrade", 5, "{\"Chunk\":{}}", 5).unwrap();
+        install_topic_state(&conn, &schema).unwrap();
+        assert_eq!(
+            topic_state(&conn, &schema, "reupgrade").unwrap(),
+            TopicState {
+                stream_generation: 7,
+                high_water_seq: 5,
+            }
         );
     }
 

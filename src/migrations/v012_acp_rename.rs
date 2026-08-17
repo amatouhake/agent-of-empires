@@ -478,4 +478,22 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2, "both orphaned rows must be merged into acp_events");
     }
+
+    #[test]
+    fn event_db_relocation_is_serialized_by_the_acp_bootstrap_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("cockpit_events.db");
+        rusqlite::Connection::open(&old).unwrap();
+        let new = dir.path().join("acp_events.db");
+
+        let lease = crate::acp_authority::acquire_bootstrap_lease(&new).unwrap();
+        assert!(crate::acp_authority::with_bootstrap_lease(&new, || {
+            relocate_events_db(dir.path())
+        })
+        .is_err());
+        drop(lease);
+
+        relocate_events_db(dir.path()).unwrap();
+        assert!(new.exists());
+    }
 }

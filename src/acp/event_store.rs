@@ -272,6 +272,7 @@ impl EventStore {
         );
         tx.commit()
             .with_context(|| format!("commit event append for {session_id}@{seq}"))?;
+        self.authority.check_path_identity()?;
         Ok(())
     }
 
@@ -295,6 +296,7 @@ impl EventStore {
         let tx = conn.unchecked_transaction()?;
         events::insert_event(&tx, &self.schema, session_id, seq, &json, created_at_ms)?;
         tx.commit()?;
+        self.authority.check_path_identity()?;
         Ok(())
     }
 
@@ -1800,28 +1802,62 @@ impl EventStore {
     /// Drop every event for a session. Called when the session is
     /// deleted or its view is switched away from structured view, so the
     /// next acp_enable starts fresh from seq=1.
-    pub fn delete_session(&self, session_id: &str) {
+    pub fn delete_session(&self, session_id: &str) -> bool {
         if let Err(e) = self.authority.check_path_identity() {
             warn!(target: "acp.event_store", "session reset authority check failed: {e}");
-            return;
+            return false;
         }
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         match events::forget_topic(&conn, &self.schema, session_id) {
-            Ok(deleted) => debug!(
-                target: "acp.event_store",
-                session = %session_id,
-                deleted,
-                "forgot session event projection"
-            ),
-            Err(e) => warn!(
-                target: "acp.event_store",
-                session = %session_id,
-                "failed to forget session event projection: {e}"
-            ),
+            Ok(deleted) => {
+                if let Err(e) = self.authority.check_path_identity() {
+                    warn!(
+                        target: "acp.event_store",
+                        session = %session_id,
+                        "session reset authority lost after commit: {e}"
+                    );
+                    return false;
+                }
+                debug!(
+                    target: "acp.event_store",
+                    session = %session_id,
+                    deleted,
+                    "forgot session event projection"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    target: "acp.event_store",
+                    session = %session_id,
+                    "failed to forget session event projection: {e}"
+                );
+                false
+            }
         }
+    }
+
+    /// Permanently remove a session's event projection, attachments, and
+    /// stream metadata. Unlike `delete_session`, this ends the topic identity
+    /// instead of creating an empty next generation.
+    pub fn hard_delete_session(&self, session_id: &str) -> Result<()> {
+        self.authority.check_path_identity()?;
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let deleted = events::hard_delete_topic(&conn, &self.schema, session_id)?;
+        self.authority.check_path_identity()?;
+        debug!(
+            target: "acp.event_store",
+            session = %session_id,
+            deleted,
+            "hard-deleted session event projection"
+        );
+        Ok(())
     }
 }
 
